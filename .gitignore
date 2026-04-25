@@ -1,0 +1,8 @@
+.claude
+.codex
+.cline_storage
+.rsync-filter
+.DS_Store
+.vscode
+.idea
+.venv
