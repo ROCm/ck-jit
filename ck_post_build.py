@@ -999,11 +999,14 @@ def link_so(hipcc, objs, out_path, arch_flags_list, rocm_lib_dir, verbose=False)
 # ---------------------------------------------------------------------------
 
 def _entry_flags(entry):
-    """Space-joined compile flags: argv without compiler binary, source, -o <out>, -c.
+    """Space-joined compile flags: argv without compiler binary, source, -o <out>, -c,
+    and visibility flags (-fvisibility=hidden, -fvisibility-inlines-hidden).
 
     The direct-mode compile script does a combined compile+link (-shared), so
-    -c must not be present.
+    -c must not be present.  Visibility flags are dropped so that blob symbols
+    are externally visible and can be found by dlsym().
     """
+    _DROP_FLAGS = frozenset({"-fvisibility=hidden", "-fvisibility-inlines-hidden"})
     argv = entry.get("argv", [])
     src  = entry.get("source", "")
     parts = []
@@ -1012,7 +1015,7 @@ def _entry_flags(entry):
         a = argv[i]
         if a == "-o" and i + 1 < len(argv):
             i += 2
-        elif a == "-c":
+        elif a == "-c" or a in _DROP_FLAGS:
             i += 1
         elif a == src or (
             os.path.basename(a) == os.path.basename(src) and

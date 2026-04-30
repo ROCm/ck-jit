@@ -174,8 +174,9 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Build flags from stored argv: skip compiler, source, -c, -o <out>;
-    # absolutize -I/-isystem paths.
+    # Build flags from stored argv: skip compiler, source, -c, -o <out>,
+    # -fvisibility=hidden/-fvisibility-inlines-hidden; absolutize -I/-isystem.
+    _DROP_FLAGS = frozenset({"-fvisibility=hidden", "-fvisibility-inlines-hidden"})
     src = entry["source"]
     flags = []
     argv = entry.get("argv", [])
@@ -184,7 +185,7 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
         a = argv[i]
         if a == "-o" and i + 1 < len(argv):
             i += 2
-        elif a == "-c":
+        elif a == "-c" or a in _DROP_FLAGS:
             i += 1
         elif a == src or (os.path.basename(a) == os.path.basename(src)
                           and a.endswith((".cpp", ".cu"))):

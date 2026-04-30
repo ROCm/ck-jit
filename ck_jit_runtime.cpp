@@ -17,9 +17,10 @@
 //   1. Look up the blob in the compile-time embedded manifest (kEntries).
 //   2. Run ck_jit_compile.sh --blob-source/--blob-flags (if found) or
 //      --blob <name> (fallback; ck_jit_compile.sh may use CK_JIT_MANIFEST).
-//   3. dlopen the resulting .so.
-//   4. Find the blob symbol via nm (file offset) + dlinfo (load bias);
-//      this works even for STV_HIDDEN symbols that dlsym cannot resolve.
+//   3. dlopen the resulting .so with RTLD_LOCAL.
+//   4. Find the blob symbol via dlsym: scan .dynsym for the first STT_FUNC
+//      symbol matching the prefix (symbols are visible — -fvisibility=hidden
+//      is stripped from blob compile flags), then call dlsym().
 //   5. Cache the function pointer.
 //   6. Forward the call.
 //
@@ -49,14 +50,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <filesystem>
-#include <link.h>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <unordered_map>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <unordered_map>
 #include <unistd.h>
 
 #include "ck_jit_manifest_embedded.h"
@@ -112,7 +115,8 @@ static int run_command(const std::string& cmd)
 // ---------------------------------------------------------------------------
 struct BlobState {
     std::once_flag  init_flag;
-    void*           fn = nullptr;   // function pointer after init
+    void*           fn     = nullptr;  // function pointer after init
+    void*           handle = nullptr;  // dlopen handle
 };
 
 // Global maps: blob_basename -> state
@@ -200,10 +204,89 @@ static const ck_jit::BlobEntry* find_blob_entry(const char* name)
 }
 
 // ---------------------------------------------------------------------------
+// ELF helper: scan .dynsym for the first STT_FUNC symbol whose name starts
+// with `prefix`, then return dlsym() result for it.
+// Blobs are compiled without -fvisibility=hidden so dlsym() finds them.
+// ---------------------------------------------------------------------------
+static void* find_sym_by_prefix(void*       handle,
+                                const char* so_path,
+                                const char* prefix)
+{
+    int fd = ::open(so_path, O_RDONLY);
+    if (fd < 0) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: cannot open %s: %s\n",
+                  so_path, ::strerror(errno));
+        return nullptr;
+    }
+
+    struct stat st{};
+    ::fstat(fd, &st);
+    size_t file_size = static_cast<size_t>(st.st_size);
+
+    void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (map == MAP_FAILED) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: mmap(%s): %s\n",
+                  so_path, ::strerror(errno));
+        return nullptr;
+    }
+
+    void* result = nullptr;
+    const auto* ehdr = static_cast<const Elf64_Ehdr*>(map);
+
+    if (file_size < sizeof(Elf64_Ehdr) ||
+        ehdr->e_ident[0] != ELFMAG0 || ehdr->e_ident[1] != ELFMAG1 ||
+        ehdr->e_ident[2] != ELFMAG2 || ehdr->e_ident[3] != ELFMAG3 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+        goto done;
+    }
+
+    {
+        const auto* shdrs = reinterpret_cast<const Elf64_Shdr*>(
+            static_cast<const char*>(map) + ehdr->e_shoff);
+        const char* shstrtab = static_cast<const char*>(map) +
+                               shdrs[ehdr->e_shstrndx].sh_offset;
+
+        const Elf64_Shdr* dynsym_h = nullptr;
+        const Elf64_Shdr* dynstr_h = nullptr;
+
+        for (int i = 0; i < ehdr->e_shnum; ++i) {
+            const char* n = shstrtab + shdrs[i].sh_name;
+            if      (shdrs[i].sh_type == SHT_DYNSYM && std::strcmp(n, ".dynsym") == 0) dynsym_h = &shdrs[i];
+            else if (shdrs[i].sh_type == SHT_STRTAB && std::strcmp(n, ".dynstr") == 0) dynstr_h = &shdrs[i];
+        }
+
+        if (!dynsym_h || !dynstr_h) goto done;
+
+        const auto* syms   = reinterpret_cast<const Elf64_Sym*>(
+            static_cast<const char*>(map) + dynsym_h->sh_offset);
+        const char* strtab = static_cast<const char*>(map) + dynstr_h->sh_offset;
+        size_t nsyms       = dynsym_h->sh_size / sizeof(Elf64_Sym);
+        size_t prefix_len  = std::strlen(prefix);
+
+        for (size_t i = 0; i < nsyms; ++i) {
+            if (ELF64_ST_TYPE(syms[i].st_info) != STT_FUNC) continue;
+            const char* sym_name = strtab + syms[i].st_name;
+            if (std::strncmp(sym_name, prefix, prefix_len) == 0) {
+                result = ::dlsym(handle, sym_name);
+                if (result)
+                    jit_log("[CK-JIT] dlsym found: %s\n", sym_name);
+                break;
+            }
+        }
+    }
+
+done:
+    ::munmap(map, file_size);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Core: compile one blob and return its function pointer.
 // ---------------------------------------------------------------------------
 static void* compile_and_load_blob(const std::string& blob_basename,
-                                   const char* symbol_prefix)
+                                   const char* symbol_prefix,
+                                   BlobState& state)
 {
     std::call_once(g_global_init, global_init);
 
@@ -212,7 +295,6 @@ static void* compile_and_load_blob(const std::string& blob_basename,
     for (char& c : safe_name)
         if (c == '/' || c == '\\') c = '_';
 
-    // Determine output .so path (use cached copy if available).
     // Strip source extension (.cpp/.cu) so the cache name is "<stem>.so".
     std::string so_stem = safe_name;
     for (const char* ext : {".cpp", ".cu"}) {
@@ -260,82 +342,30 @@ static void* compile_and_load_blob(const std::string& blob_basename,
         jit_log("[CK-JIT] Using cached blob: %s\n", so_path.c_str());
     }
 
-    // Load the blob .so.  RTLD_NOW resolves relocations immediately.
-    // RTLD_GLOBAL is required: the HIP runtime looks up the GPU kernel
-    // descriptor by name (via hipGetSymbolAddress) during kernel launch; if the
-    // .so is LOCAL, those symbols are invisible to HIP's global registry and
-    // the launch silently fails with "Cannot find Symbol".
-    void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    // Load the blob .so into a local namespace so its symbols do not pollute
+    // the global dynamic linker namespace.  The HIP runtime registers the fat
+    // binary via another mechanism and works correctly with RTLD_LOCAL.
+    void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         ::fprintf(stderr,
             "[CK-JIT] ERROR: dlopen(%s) failed: %s\n",
             so_path.c_str(), ::dlerror());
         return nullptr;
     }
+    state.handle = handle;
 
-    // Blob template specialisations are compiled with -fvisibility=hidden
-    // (the original CK build command stored in the manifest).  This gives them
-    // STV_HIDDEN ELF visibility, which the dynamic linker converts to LOCAL
-    // binding in the final .so — they show as lowercase 't' in nm output and
-    // cannot be found by dlsym().
-    //
-    // Work-around: use nm to read the *file offset* of the symbol, then use
-    // dlinfo(RTLD_DI_LINKMAP) to get the library's load bias (l_addr), and
-    // compute the runtime address directly.  This bypasses the dynamic symbol
-    // table entirely and works for any ELF visibility.
-    //
-    // nm output format:  <hex-offset> [Tt] <mangled-name>
-    // We filter by type [Tt] and by the mangled-name prefix (e.g. "_Z9fmha_fwd_I")
-    // which uniquely identifies the top-level template instantiation
-    // (lambda closures start with _ZZ, namespace symbols with _ZN).
-    std::string nm_cmd =
-        "nm --defined-only " + so_path +
-        " | awk '($2==\"t\"||$2==\"T\") && index($3,\"" + symbol_prefix + "\")>0"
-        " {print $1; exit}'";
-
-    FILE* pipe = ::popen(nm_cmd.c_str(), "r");
-    if (!pipe) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: popen(nm) failed for %s.\n",
-                  so_path.c_str());
-        return nullptr;
-    }
-    char offset_buf[64] = {};
-    bool got_offset = (::fgets(offset_buf, sizeof(offset_buf), pipe) != nullptr);
-    ::pclose(pipe);
-
-    if (!got_offset || offset_buf[0] == '\0' || offset_buf[0] == '\n') {
+    // Scan .dynsym for the blob function and resolve it via dlsym.
+    // Blobs are compiled without -fvisibility=hidden so the symbol is exported.
+    void* fn = find_sym_by_prefix(handle, so_path.c_str(), symbol_prefix);
+    if (!fn) {
         ::fprintf(stderr,
             "[CK-JIT] ERROR: No '%s' symbol found in %s.\n",
             symbol_prefix, so_path.c_str());
         return nullptr;
     }
 
-    // Parse the hex offset emitted by nm (no leading 0x).
-    char* endp = nullptr;
-    uintptr_t sym_offset = static_cast<uintptr_t>(
-        ::strtoull(offset_buf, &endp, 16));
-    if (endp == offset_buf) {
-        ::fprintf(stderr,
-            "[CK-JIT] ERROR: Failed to parse nm offset '%s' for %s.\n",
-            offset_buf, symbol_prefix);
-        return nullptr;
-    }
-
-    // Get the library's runtime load bias via the link_map.
-    struct link_map* lm = nullptr;
-    if (::dlinfo(handle, RTLD_DI_LINKMAP, &lm) != 0 || !lm) {
-        ::fprintf(stderr,
-            "[CK-JIT] ERROR: dlinfo(RTLD_DI_LINKMAP) failed for %s: %s\n",
-            so_path.c_str(), ::dlerror());
-        return nullptr;
-    }
-
-    void* fn = reinterpret_cast<void*>(
-        static_cast<uintptr_t>(lm->l_addr) + sym_offset);
-
-    jit_log("[CK-JIT] Resolved %s -> %s @ +0x%lx => %p\n",
-            blob_basename.c_str(), symbol_prefix,
-            static_cast<unsigned long>(sym_offset), fn);
+    jit_log("[CK-JIT] Resolved %s -> %s => %p\n",
+            blob_basename.c_str(), symbol_prefix, fn);
     return fn;
 }
 
@@ -414,7 +444,7 @@ float ck_jit_fwd_call(const char* blob,
 {
     BlobState* state = get_fwd_state(blob);
     std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z9fmha_fwd_I");
+        state->fn = compile_and_load_blob(blob, "_Z9fmha_fwd_I", *state);
     });
     if (!state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: fwd blob not resolved: %s\n", blob);
@@ -438,7 +468,7 @@ float ck_jit_fwd_splitkv_call(const char* sv_blob,
     // Resolve splitkv blob (has fmha_fwd_splitkv_oneshot_ symbol).
     BlobState* sv_state = get_sv_state(sv_blob);
     std::call_once(sv_state->init_flag, [&]() {
-        sv_state->fn = compile_and_load_blob(sv_blob, "_Z25fmha_fwd_splitkv_oneshot_I");
+        sv_state->fn = compile_and_load_blob(sv_blob, "_Z25fmha_fwd_splitkv_oneshot_I", *sv_state);
     });
     if (!sv_state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: splitkv blob not resolved: %s\n", sv_blob);
@@ -448,7 +478,7 @@ float ck_jit_fwd_splitkv_call(const char* sv_blob,
     // Resolve combine blob (has fmha_fwd_splitkv_combine_oneshot_ symbol).
     BlobState* cb_state = get_sv_combine_state(combine_blob);
     std::call_once(cb_state->init_flag, [&]() {
-        cb_state->fn = compile_and_load_blob(combine_blob, "_Z33fmha_fwd_splitkv_combine_oneshot_I");
+        cb_state->fn = compile_and_load_blob(combine_blob, "_Z33fmha_fwd_splitkv_combine_oneshot_I", *cb_state);
     });
     if (!cb_state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: splitkv combine blob not resolved: %s\n", combine_blob);
@@ -474,7 +504,7 @@ float ck_jit_batch_prefill_call(const char* blob,
 {
     BlobState* state = get_bp_state(blob);
     std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z19fmha_batch_prefill_I");
+        state->fn = compile_and_load_blob(blob, "_Z19fmha_batch_prefill_I", *state);
     });
     if (!state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: batch_prefill blob not resolved: %s\n", blob);
@@ -496,7 +526,7 @@ float ck_jit_bwd_dot_do_o_call(const char* blob,
 {
     BlobState* state = get_bwd_dot_do_o_state(blob);
     std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z18fmha_bwd_dot_do_o_I");
+        state->fn = compile_and_load_blob(blob, "_Z18fmha_bwd_dot_do_o_I", *state);
     });
     if (!state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: bwd dot_do_o blob not resolved: %s\n", blob);
@@ -512,7 +542,7 @@ float ck_jit_bwd_dq_dk_dv_call(const char* blob,
 {
     BlobState* state = get_bwd_dq_dk_dv_state(blob);
     std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z18fmha_bwd_dq_dk_dv_I");
+        state->fn = compile_and_load_blob(blob, "_Z18fmha_bwd_dq_dk_dv_I", *state);
     });
     if (!state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: bwd dq_dk_dv blob not resolved: %s\n", blob);
@@ -528,7 +558,7 @@ float ck_jit_bwd_convert_dq_call(const char* blob,
 {
     BlobState* state = get_bwd_convert_dq_state(blob);
     std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z20fmha_bwd_convert_dq_I");
+        state->fn = compile_and_load_blob(blob, "_Z20fmha_bwd_convert_dq_I", *state);
     });
     if (!state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: bwd convert_dq blob not resolved: %s\n", blob);

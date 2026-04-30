@@ -192,6 +192,7 @@ else:
     src_rel = entry["source"]
     result_argv = [args.hipcc]
     has_output = False
+    drop_flags = {"-fvisibility=hidden", "-fvisibility-inlines-hidden"}
     i = 0
     while i < len(stored):
         a = stored[i]
@@ -199,6 +200,8 @@ else:
             result_argv.extend(["-o", obj_out])
             has_output = True
             i += 2
+        elif a in drop_flags:
+            i += 1
         elif a == src_rel:
             result_argv.append(_abs(a))
             i += 1

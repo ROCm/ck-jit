@@ -73,9 +73,11 @@ On the first call for a given kernel variant:
    - **Not found**: `--blob <stem>` (manifest mode — `ck_jit_compile.sh`
      looks up the blob in `CK_JIT_MANIFEST` or the installed
      `ck_jit_manifest.json`).
-3. `dlopen`s the resulting `.so`.
-4. Resolves the blob function pointer via `nm` + `dlinfo` load bias (handles
-   `STV_HIDDEN` symbols unreachable by `dlsym`).
+3. `dlopen`s the resulting `.so` with `RTLD_LOCAL`.
+4. Resolves the blob function pointer by scanning the `.dynsym` ELF section
+   for the first `STT_FUNC` symbol matching the expected name prefix, then
+   calling `dlsym()`. Symbols are visible because `-fvisibility=hidden` is
+   stripped from blob compile flags.
 5. Caches the pointer under a `std::once_flag` — zero overhead on subsequent
    calls.
 
