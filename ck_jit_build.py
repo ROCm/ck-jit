@@ -19,7 +19,8 @@
 #
 # Usage (quick):
 #   python3 ck_jit_build.py quick \
-#       --tmp-dir   <path>   \
+#       --tmp-dir    <path>   \
+#       [--aiter-dir <path>]  \
 #       [--install-dir <path>]  \
 #       [--verbose]
 
@@ -171,7 +172,28 @@ def _count_ndjson(path):
         return None
 
 
-def _install_artifacts(ndjson_path, aiter_dir, install_dir, aiter_test_dir, jit_build_script):
+def _resolve_so_from_state(tmp_dir, lib, aiter_dir):
+    """Read out_so from quick-rebuild state file, resolve path prefixes."""
+    state_path = os.path.join(tmp_dir, lib, "ck_jit_quick_rebuild.json")
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    out_so = state.get("out_so", "")
+    if not out_so:
+        return None
+    if out_so.startswith("{jit}/"):
+        return os.path.join(tmp_dir, out_so[len("{jit}/"):])
+    if out_so.startswith("{aiter}/"):
+        stored_aiter = state.get("aiter_dir", "") or aiter_dir
+        return os.path.join(stored_aiter, out_so[len("{aiter}/"):])
+    if out_so.startswith("{script}/"):
+        return os.path.join(_SCRIPT_DIR, out_so[len("{script}/"):])
+    return out_so
+
+
+def _install_artifacts(tmp_dir, aiter_dir, install_dir):
     """
     Copy libmha_fwd.so / libmha_bwd.so to install_dir, then build the
     deployable ck_jit/ subdirectory:
@@ -180,22 +202,24 @@ def _install_artifacts(ndjson_path, aiter_dir, install_dir, aiter_test_dir, jit_
       - blob .cpp sources (relative layout preserved)
       - include dirs referenced by -I flags in the manifest
     """
+    ndjson_path = os.path.join(tmp_dir, "manifest.json.ndjson")
     os.makedirs(install_dir, exist_ok=True)
-    for so in ("libmha_fwd.so", "libmha_bwd.so"):
-        src = os.path.join(aiter_test_dir, so)
-        if os.path.exists(src):
+    for lib in ("libmha_fwd", "libmha_bwd"):
+        src = _resolve_so_from_state(tmp_dir, lib, aiter_dir)
+        so_name = lib + ".so"
+        if src and os.path.exists(src):
             shutil.copy2(src, install_dir)
         else:
-            print(f"{_TAG} WARNING: {src} not found, skipping copy.", file=sys.stderr)
+            print(f"{_TAG} WARNING: {so_name} not found, skipping copy.", file=sys.stderr)
 
     jit_artifact_dir = os.path.join(install_dir, "ck_jit")
     os.makedirs(jit_artifact_dir, exist_ok=True)
 
-    # Copy the runtime build script.
-    dst_build_sh = os.path.join(jit_artifact_dir, "ck_jit_compile.sh")
-    shutil.copy2(jit_build_script, dst_build_sh)
-    os.chmod(dst_build_sh,
-             os.stat(dst_build_sh).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    # Copy runtime scripts.
+    for name in ("ck_jit_compile.sh", "ck_jit_prebuild.py"):
+        dst = os.path.join(jit_artifact_dir, name)
+        shutil.copy2(os.path.join(_SCRIPT_DIR, name), dst)
+        os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     aiter_dir = os.path.abspath(aiter_dir)
     jit_dir   = os.path.abspath(jit_artifact_dir)
@@ -337,11 +361,12 @@ def cmd_full(args):
         "CXX":                             fake_cxx,
         "CK_JIT_REAL_COMPILER":            real_hipcc,
         "CK_JIT_TMP_DIR":                  tmp_dir,
-        "CK_JIT_ROOT":                     aiter_dir,
+        "CK_JIT_AITER_DIR":                aiter_dir,
         "CK_JIT_INTERCEPT_ALL":            "1",
         "CK_JIT_RUNTIME_SRC":              runtime_src,
         "CK_JIT_CK_INCLUDE":               ck_include_dir,
         "CK_JIT_AITER_INCLUDE":            aiter_include_dir,
+        "CK_JIT_ROCM_INCLUDE":             os.path.join(real_rocm, "include"),
         "CK_JIT_JOBS":                     str(multiprocessing.cpu_count()),
         "CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT": str(ck_tile_bf16),
         "GPU_ARCHS":                       gpu_archs,
@@ -361,14 +386,13 @@ def cmd_full(args):
     print(f"{_TAG} Manifest has {n if n is not None else '?'} entries.", file=sys.stderr)
 
     if install_dir:
-        _install_artifacts(ndjson, aiter_dir, install_dir, aiter_test_dir, build_script)
+        _install_artifacts(tmp_dir, aiter_dir, install_dir)
 
     print(f"{_TAG} JIT build complete.", file=sys.stderr)
     print(f"", file=sys.stderr)
     print(f"{_TAG} Runtime environment variables (optional overrides):", file=sys.stderr)
-    print(f"  TE_CK_JIT_ROOT  — default: {{dir of libmha_fwd.so}}/ck_jit/", file=sys.stderr)
-    print(f"                    contains: ck_jit_manifest.json, ck_jit_compile.sh, cache/",
-          file=sys.stderr)
+    print(f"  CK_JIT_ROOT     — default: {{dir of libmha_fwd.so}}/ck_jit/", file=sys.stderr)
+    print(f"                    expected: ck_jit_compile.sh", file=sys.stderr)
     print(f"  CK_JIT_VERBOSE  — set to 1 for progress messages", file=sys.stderr)
     print(f"  Each CK kernel variant is compiled on first use.", file=sys.stderr)
 
@@ -392,7 +416,8 @@ def cmd_quick(args):
         if not os.path.exists(state_path):
             print(f"[CK-QUICK] No state for {lib} ({state_path}), skipping.", file=sys.stderr)
             continue
-        r, out_so = ck_post_build.quick_rebuild_lib(state_path, verbose=args.verbose)
+        r, out_so = ck_post_build.quick_rebuild_lib(
+            state_path, verbose=args.verbose, aiter_dir=args.aiter_dir)
         if r != 0:
             rc = r
             continue
@@ -433,6 +458,8 @@ def main():
                          help="Recompile ck_jit_runtime.cpp and re-link (dev option).")
     qp.add_argument("--tmp-dir",     required=True,
                     help="JIT tmp dir used in the prior full build.")
+    qp.add_argument("--aiter-dir",   default="",
+                    help="Path to aiter root (overrides $CK_JIT_AITER_DIR).")
     qp.add_argument("--install-dir", default="",
                     help="Copy rebuilt .so files here after linking.")
     qp.add_argument("--verbose",     action="store_true")

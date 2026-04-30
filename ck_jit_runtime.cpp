@@ -14,8 +14,9 @@
 //   ck_jit_bwd_convert_dq_call("blob_basename.cu", s, a)      (bwd, one call per sub-kernel)
 //
 // On the first call for a given blob:
-//   1. Load the manifest to find the compile command for that blob.
-//   2. Run ck_jit_compile.sh --blob <name> --output <cache>/<name>.so
+//   1. Look up the blob in the compile-time embedded manifest (kEntries).
+//   2. Run ck_jit_compile.sh --blob-source/--blob-flags (if found) or
+//      --blob <name> (fallback; ck_jit_compile.sh may use CK_JIT_MANIFEST).
 //   3. dlopen the resulting .so.
 //   4. Find the blob symbol via nm (file offset) + dlinfo (load bias);
 //      this works even for STV_HIDDEN symbols that dlsym cannot resolve.
@@ -26,13 +27,12 @@
 // (checked under a per-blob std::once_flag, zero contention after init).
 //
 // Environment variables:
-//   TE_CK_JIT_ROOT   Root directory for all JIT artifacts.
-//                    Default: {dir of this .so}/ck_jit/
-//                    Subtree layout expected under this root:
-//                      ck_jit_manifest.json  — blob compile-command manifest
-//                      ck_jit_compile.sh       — per-blob build script
-//                      cache/                — compiled blob .so files
-//                      (includes resolved via --root passed to build script)
+//   CK_JIT_ROOT      Root directory for JIT scripts and blob sources.
+//                    Default: compile-time CK_JIT_ROOT define, or {dir of this .so}/ck_jit/
+//                    Expected under this root: ck_jit_compile.sh
+//   CK_JIT_CACHE_DIR Directory for compiled blob .so files.
+//                    Default: $XDG_CACHE_HOME/<CK_JIT_NAME>
+//                          or $HOME/.cache/<CK_JIT_NAME>
 //   CK_JIT_VERBOSE   Set to "1" for progress messages.
 
 // mha_bwd.h → fmha_bwd.hpp and mha_fwd.h → fmha_fwd.hpp both define FmhaMasks.
@@ -42,6 +42,7 @@
 #include "mha_fwd.h"
 #undef FmhaMasks
 
+#include <algorithm>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -58,15 +59,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "ck_jit_manifest_embedded.h"
+
 // ---------------------------------------------------------------------------
 // Types matching the blob function signatures (stream_config first, args second).
 // Note: mha_fwd.h's aiter::mha_fwd takes (args, stream) but the CK blob
 // specialisations take (stream, args) — they are different call conventions.
 // ---------------------------------------------------------------------------
+#if CK_JIT_IS_FWD
 using fn_blob_fwd_t    = float (*)(const ck_tile::stream_config&, fmha_fwd_args);
 using fn_blob_sv_t     = void  (*)(const ck_tile::stream_config&, fmha_fwd_splitkv_args);
 using fn_blob_bp_t     = float (*)(const ck_tile::stream_config&, fmha_batch_prefill_args);
+#else
 using fn_blob_bwd_t    = float (*)(const ck_tile::stream_config&, fmha_bwd_args);
+#endif
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -111,48 +117,86 @@ struct BlobState {
 
 // Global maps: blob_basename -> state
 // Protected by a shared_mutex for read-heavy access after warm-up.
+#if CK_JIT_IS_FWD
 std::shared_mutex         g_fwd_mtx;
 std::shared_mutex         g_sv_mtx;
 std::shared_mutex         g_sv_combine_mtx;
 std::shared_mutex         g_bp_mtx;
-std::shared_mutex         g_bwd_dot_do_o_mtx;
-std::shared_mutex         g_bwd_dq_dk_dv_mtx;
-std::shared_mutex         g_bwd_convert_dq_mtx;
 std::unordered_map<std::string, BlobState*> g_fwd_blobs;
 std::unordered_map<std::string, BlobState*> g_sv_blobs;
 std::unordered_map<std::string, BlobState*> g_sv_combine_blobs;
 std::unordered_map<std::string, BlobState*> g_bp_blobs;
+#else
+std::shared_mutex         g_bwd_dot_do_o_mtx;
+std::shared_mutex         g_bwd_dq_dk_dv_mtx;
+std::shared_mutex         g_bwd_convert_dq_mtx;
 std::unordered_map<std::string, BlobState*> g_bwd_dot_do_o_blobs;
 std::unordered_map<std::string, BlobState*> g_bwd_dq_dk_dv_blobs;
 std::unordered_map<std::string, BlobState*> g_bwd_convert_dq_blobs;
+#endif
+
+#ifndef CK_JIT_NAME
+#  define CK_JIT_NAME "ck_jit"
+#endif
+
+#ifndef CK_JIT_ROOT
+#  define CK_JIT_ROOT "ck_jit"
+#endif
 
 // Global verbose/path init (done once).
 std::once_flag g_global_init;
-std::string    g_manifest;
 std::string    g_cache_dir;
 std::string    g_build_script;
-std::string    g_root;   // AITER install root; passed as --root to the build script
+
+static std::string default_cache_dir()
+{
+    // $XDG_CACHE_HOME/<JIT_NAME>  or  $HOME/.cache/<JIT_NAME>
+    const char* base = ::getenv("XDG_CACHE_HOME");
+    if (base && base[0])
+        return std::string(base) + "/" + CK_JIT_NAME;
+    const char* home = ::getenv("HOME");
+    if (home && home[0])
+        return std::string(home) + "/.cache/" + CK_JIT_NAME;
+    return std::string("/tmp/") + CK_JIT_NAME;
+}
 
 static void global_init()
 {
     g_verbose = (::getenv("CK_JIT_VERBOSE") &&
                  std::string(::getenv("CK_JIT_VERBOSE")) == "1");
 
-    // TE_CK_JIT_ROOT overrides the default; otherwise use {lib_dir}/ck_jit/.
-    // All sub-paths (manifest, build script, cache, includes) live under this root.
+    // CK_JIT_ROOT env overrides; compile-time CK_JIT_ROOT define sets the baked-in
+    // default; if both are empty, fall back to {lib_dir}/ck_jit/.
+    // A relative path (from env or define) is resolved against the .so directory.
+    // Build script lives here; cache dir is separate (CK_JIT_CACHE_DIR).
     std::filesystem::path jit_root;
     {
-        const char* env = ::getenv("TE_CK_JIT_ROOT");
+        const char* env = ::getenv("CK_JIT_ROOT");
         if (env && env[0])
             jit_root = env;
         else
-            jit_root = self_lib_dir() / "ck_jit";
+            jit_root = CK_JIT_ROOT;
     }
+    if (jit_root.is_relative())
+        jit_root = self_lib_dir() / jit_root;
 
-    g_root         = jit_root.string();
-    g_manifest     = (jit_root / "ck_jit_manifest.json").string();
-    g_cache_dir    = (jit_root / "cache").string();
+    {
+        const char* env = ::getenv("CK_JIT_CACHE_DIR");
+        g_cache_dir = (env && env[0]) ? env : default_cache_dir();
+    }
     g_build_script = (jit_root / "ck_jit_compile.sh").string();
+}
+
+static const ck_jit::BlobEntry* find_blob_entry(const char* name)
+{
+    auto it = std::lower_bound(
+        std::begin(ck_jit::kEntries), std::end(ck_jit::kEntries), name,
+        [](const ck_jit::BlobEntry& e, const char* n) {
+            return std::strcmp(e.name, n) < 0;
+        });
+    if (it != std::end(ck_jit::kEntries) && std::strcmp(it->name, name) == 0)
+        return it;
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +213,15 @@ static void* compile_and_load_blob(const std::string& blob_basename,
         if (c == '/' || c == '\\') c = '_';
 
     // Determine output .so path (use cached copy if available).
-    std::string so_path = g_cache_dir + "/" + safe_name + ".so";
+    // Strip source extension (.cpp/.cu) so the cache name is "<stem>.so".
+    std::string so_stem = safe_name;
+    for (const char* ext : {".cpp", ".cu"}) {
+        if (so_stem.size() > std::strlen(ext) &&
+            so_stem.compare(so_stem.size() - std::strlen(ext),
+                            std::strlen(ext), ext) == 0)
+        { so_stem.resize(so_stem.size() - std::strlen(ext)); break; }
+    }
+    std::string so_path = g_cache_dir + "/" + so_stem + ".so";
 
     struct stat st{};
     bool cached = (::stat(so_path.c_str(), &st) == 0);
@@ -179,20 +231,22 @@ static void* compile_and_load_blob(const std::string& blob_basename,
             ::access(g_build_script.c_str(), X_OK) != 0) {
             ::fprintf(stderr,
                 "[CK-JIT] ERROR: ck_jit_compile.sh not found at %s. "
-                "Set TE_CK_JIT_ROOT to the JIT artifact directory.\n",
+                "Set CK_JIT_ROOT to the JIT artifact directory.\n",
                 g_build_script.c_str());
             return nullptr;
         }
         ::fprintf(stderr,
             "[CK-JIT] JIT-compiling blob: %s\n", blob_basename.c_str());
 
-        std::string cmd =
-            "bash " + g_build_script +
-            " --manifest "  + g_manifest +
-            " --blob "      + blob_basename +
-            " --output "    + so_path +
-            " --cache-dir " + g_cache_dir +
-            " --root "      + g_root;
+        const ck_jit::BlobEntry* entry = find_blob_entry(blob_basename.c_str());
+        std::string cmd = "bash " + g_build_script;
+        if (entry) {
+            cmd += " --blob-source '" + std::string(entry->source) + "'"
+                   " --blob-flags '"  + std::string(entry->flags)  + "'";
+        } else {
+            cmd += " --blob " + blob_basename;
+        }
+        cmd += " --output " + so_path;
         if (g_verbose) cmd += " --verbose";
 
         int rc = run_command(cmd);
@@ -304,6 +358,7 @@ static BlobState* _get_state(std::shared_mutex& mtx,
     return ptr;
 }
 
+#if CK_JIT_IS_FWD
 static BlobState* get_fwd_state(const char* blob)
 {
     return _get_state(g_fwd_mtx, g_fwd_blobs, blob);
@@ -320,6 +375,7 @@ static BlobState* get_bp_state(const char* blob)
 {
     return _get_state(g_bp_mtx, g_bp_blobs, blob);
 }
+#else
 static BlobState* get_bwd_dot_do_o_state(const char* blob)
 {
     return _get_state(g_bwd_dot_do_o_mtx, g_bwd_dot_do_o_blobs, blob);
@@ -332,6 +388,7 @@ static BlobState* get_bwd_convert_dq_state(const char* blob)
 {
     return _get_state(g_bwd_convert_dq_mtx, g_bwd_convert_dq_blobs, blob);
 }
+#endif
 
 } // anonymous namespace
 
@@ -342,6 +399,15 @@ static BlobState* get_bwd_convert_dq_state(const char* blob)
 extern "C" {
 
 __attribute__((visibility("default")))
+void ck_jit_set_cache_dir(const char* path)
+{
+    std::call_once(g_global_init, global_init);
+    if (path && path[0])
+        g_cache_dir = path;
+}
+
+#if CK_JIT_IS_FWD
+__attribute__((visibility("hidden")))
 float ck_jit_fwd_call(const char* blob,
                       const ck_tile::stream_config& s,
                       fmha_fwd_args a)
@@ -363,7 +429,7 @@ float ck_jit_fwd_call(const char* blob,
 // of directly instantiating the blob oneshot_ functions.
 // ---------------------------------------------------------------------------
 
-__attribute__((visibility("default")))
+__attribute__((visibility("hidden")))
 float ck_jit_fwd_splitkv_call(const char* sv_blob,
                                const char* combine_blob,
                                const ck_tile::stream_config& s,
@@ -401,7 +467,7 @@ float ck_jit_fwd_splitkv_call(const char* sv_blob,
 // BatchPrefill JIT call: single blob per dispatch.
 // ---------------------------------------------------------------------------
 
-__attribute__((visibility("default")))
+__attribute__((visibility("hidden")))
 float ck_jit_batch_prefill_call(const char* blob,
                                  const ck_tile::stream_config& s,
                                  fmha_batch_prefill_args a)
@@ -416,14 +482,14 @@ float ck_jit_batch_prefill_call(const char* blob,
     }
     return reinterpret_cast<fn_blob_bp_t>(state->fn)(s, a);
 }
-
+#else
 // ---------------------------------------------------------------------------
 // Bwd per-sub-kernel JIT calls.
 // Each bwd dispatch site calls three of these (dot_do_o, dq_dk_dv, convert_dq).
 // All three sub-kernel blobs return float (via ck_tile::launch_kernel).
 // ---------------------------------------------------------------------------
 
-__attribute__((visibility("default")))
+__attribute__((visibility("hidden")))
 float ck_jit_bwd_dot_do_o_call(const char* blob,
                                 const ck_tile::stream_config& s,
                                 fmha_bwd_args a)
@@ -439,7 +505,7 @@ float ck_jit_bwd_dot_do_o_call(const char* blob,
     return reinterpret_cast<fn_blob_bwd_t>(state->fn)(s, a);
 }
 
-__attribute__((visibility("default")))
+__attribute__((visibility("hidden")))
 float ck_jit_bwd_dq_dk_dv_call(const char* blob,
                                 const ck_tile::stream_config& s,
                                 fmha_bwd_args a)
@@ -455,7 +521,7 @@ float ck_jit_bwd_dq_dk_dv_call(const char* blob,
     return reinterpret_cast<fn_blob_bwd_t>(state->fn)(s, a);
 }
 
-__attribute__((visibility("default")))
+__attribute__((visibility("hidden")))
 float ck_jit_bwd_convert_dq_call(const char* blob,
                                   const ck_tile::stream_config& s,
                                   fmha_bwd_args a)
@@ -470,6 +536,7 @@ float ck_jit_bwd_convert_dq_call(const char* blob,
     }
     return reinterpret_cast<fn_blob_bwd_t>(state->fn)(s, a);
 }
+#endif
 
 } // extern "C"
 

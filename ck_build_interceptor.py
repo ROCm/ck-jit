@@ -35,7 +35,7 @@
 #   CK_JIT_AITER_INCLUDE  aiter csrc/include (for ck_jit_runtime.cpp compile)
 #   CK_JIT_ROCM_INCLUDE   ROCm system include dir
 #   CK_JIT_JOBS           Parallel compile jobs for post-build (default: nproc)
-#   CK_JIT_ROOT           AITER root directory; paths in the manifest are stored
+#   CK_JIT_AITER_DIR      AITER root directory; paths in the manifest are stored
 #                         relative to this dir to keep entries short and portable.
 
 import fcntl
@@ -52,7 +52,7 @@ REAL_COMPILER   = os.environ.get("CK_JIT_REAL_COMPILER", "")
 JIT_TMP_DIR     = os.environ.get("CK_JIT_TMP_DIR", "/tmp/ck_jit")
 MANIFEST_PATH   = os.path.join(JIT_TMP_DIR, "manifest.json")
 INTERCEPT_ALL   = os.environ.get("CK_JIT_INTERCEPT_ALL", "0") == "1"
-ROOT            = os.environ.get("CK_JIT_ROOT", "")
+ROOT            = os.environ.get("CK_JIT_AITER_DIR", "")
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
