@@ -335,7 +335,8 @@ def cmd_clean(args):
             return 0
         for p in targets:
             os.remove(p)
-            print(f"{_TAG} Removed {p}", file=sys.stderr)
+            if args.verbose:
+                print(f"{_TAG} Removed {p}", file=sys.stderr)
         print(f"{_TAG} Cleaned {len(targets)} file(s) from {cache_dir}.", file=sys.stderr)
         return 0
 
@@ -355,7 +356,8 @@ def cmd_clean(args):
                   _glob.glob(os.path.join(cache_dir, key + ".so.*"))):
             if os.path.exists(p):
                 os.remove(p)
-                print(f"{_TAG} Removed {p}", file=sys.stderr)
+                if args.verbose:
+                    print(f"{_TAG} Removed {p}", file=sys.stderr)
                 removed += 1
 
     print(f"{_TAG} Removed {removed} file(s).", file=sys.stderr)
@@ -425,6 +427,8 @@ def main():
     cp.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
                     help="Cache directory to clean "
                          "(required; or set $CK_JIT_CACHE_DIR).")
+    cp.add_argument("--verbose", action="store_true",
+                    help="Print each removed file path.")
     _add_blob_args(cp)
 
     args = ap.parse_args()

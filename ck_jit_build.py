@@ -36,6 +36,75 @@ import tempfile
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TAG = "[CK-JIT]"
 
+# Patch that adds //jit_kernel: comments to the CK codegen scripts so that
+# generated *_api.cpp files carry per-condition kernel name hints.  Stored
+# relative to this script; applied before codegen runs, reverted afterwards.
+_CODEGEN_PATCH = os.path.join(_SCRIPT_DIR, "codegen_jit_hints.patch")
+
+
+# ---------------------------------------------------------------------------
+# Codegen patch apply / revert
+# ---------------------------------------------------------------------------
+
+def _apply_codegen_patch(codegen_dir):
+    """Apply codegen_jit_hints.patch to the CK codegen ops directory.
+
+    codegen_dir — path to the composable_kernel submodule root (the directory
+    that contains example/ck_tile/01_fmha/codegen/ops/).
+
+    Fails atomically: a dry-run is performed first so that no .rej files or
+    partial modifications are written when the patch cannot be applied cleanly.
+
+    Returns True on success, False if patch could not be applied.
+    """
+    if not os.path.exists(_CODEGEN_PATCH):
+        print(f"{_TAG} ERROR: codegen patch not found: {_CODEGEN_PATCH}",
+              file=sys.stderr)
+        return False
+
+    base_cmd = ["patch", "-p1", "--forward", "--input", _CODEGEN_PATCH]
+
+    # Dry-run first — no files are written, no .rej files created.
+    dry = subprocess.run(
+        base_cmd + ["--dry-run"],
+        cwd=codegen_dir, capture_output=True, text=True,
+    )
+    if dry.returncode != 0:
+        if "already" in dry.stdout or "Reversed" in dry.stdout:
+            print(f"{_TAG} Codegen patch already applied.", file=sys.stderr)
+            return True
+        print(f"{_TAG} ERROR: codegen patch cannot be applied cleanly "
+              f"(dry-run failed, no files modified):\n{dry.stdout}{dry.stderr}",
+              file=sys.stderr)
+        return False
+
+    # Dry-run succeeded — apply for real.
+    r = subprocess.run(base_cmd, cwd=codegen_dir, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"{_TAG} ERROR: codegen patch apply failed:\n{r.stdout}{r.stderr}",
+              file=sys.stderr)
+        return False
+    print(f"{_TAG} Codegen patch applied.", file=sys.stderr)
+    return True
+
+
+def _revert_codegen_patch(codegen_dir):
+    """Revert codegen_jit_hints.patch from the CK codegen ops directory."""
+    if not os.path.exists(_CODEGEN_PATCH):
+        return
+    r = subprocess.run(
+        ["patch", "-p1", "--reverse", "--input", _CODEGEN_PATCH],
+        cwd=codegen_dir, capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        if "already" in r.stdout or "Reversed" in r.stdout:
+            print(f"{_TAG} Codegen patch already reverted.", file=sys.stderr)
+            return
+        print(f"{_TAG} WARNING: could not revert codegen patch:\n{r.stdout}{r.stderr}",
+              file=sys.stderr)
+        return
+    print(f"{_TAG} Codegen patch reverted.", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # ROCm discovery
@@ -372,8 +441,17 @@ def cmd_full(args):
         "GPU_ARCHS":                       gpu_archs,
     })
 
+    ck_submodule = os.path.join(aiter_dir, "3rdparty", "composable_kernel")
+    if not _apply_codegen_patch(ck_submodule):
+        if _tmp_owner:
+            shutil.rmtree(_tmp_owner, ignore_errors=True)
+        return 1
+
     print(f"{_TAG} Starting parallel fwd/bwd compilation...", file=sys.stderr)
-    rc = _run_parallel_compile(env, compile_py, tmp_dir)
+    try:
+        rc = _run_parallel_compile(env, compile_py, tmp_dir)
+    finally:
+        _revert_codegen_patch(ck_submodule)
 
     if rc != 0:
         if _tmp_owner:
@@ -410,7 +488,7 @@ def cmd_quick(args):
     import ck_post_build
 
     tmp_dir = os.path.abspath(args.tmp_dir)
-    rc = 0
+    results = []
     for lib in ("libmha_fwd", "libmha_bwd"):
         state_path = os.path.join(tmp_dir, lib, "ck_jit_quick_rebuild.json")
         if not os.path.exists(state_path):
@@ -419,14 +497,21 @@ def cmd_quick(args):
         r, out_so = ck_post_build.quick_rebuild_lib(
             state_path, verbose=args.verbose, aiter_dir=args.aiter_dir)
         if r != 0:
-            rc = r
-            continue
-        if args.install_dir and out_so:
-            os.makedirs(args.install_dir, exist_ok=True)
-            shutil.copy2(out_so, args.install_dir)
-            print(f"[CK-QUICK] Installed {os.path.basename(out_so)} → {args.install_dir}",
-                  file=sys.stderr)
-    return rc
+            print(f"[CK-QUICK] FAILED: {lib}", file=sys.stderr)
+        results.append((r, out_so))
+
+    if any(r != 0 for r, _ in results):
+        print("[CK-QUICK] Build failed — nothing installed.", file=sys.stderr)
+        return 1
+
+    if args.install_dir:
+        os.makedirs(args.install_dir, exist_ok=True)
+        for _, out_so in results:
+            if out_so:
+                shutil.copy2(out_so, args.install_dir)
+                print(f"[CK-QUICK] Installed {os.path.basename(out_so)} → {args.install_dir}",
+                      file=sys.stderr)
+    return 0
 
 
 # ---------------------------------------------------------------------------
