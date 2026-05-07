@@ -8,10 +8,12 @@
 #   1. Parse the compiler invocation to extract source, output, and flags.
 #   2. Append the full command to a JSON manifest so it can be re-run later.
 #   3. For blob files: write an empty stub file (no compiler invocation).
-#   4. For api files (fmha_fwd_api, fmha_bwd_api): write an empty stub file.
-#      The real rewrite+compile happens at link-step interception time.
+#   4. For api files (fmha_fwd_api, fmha_bwd_api): rewrite the source via
+#      ck_api_rewrite and compile it immediately; write a real .o (not a stub).
+#      The manifest records the rewritten source path and kernel names for
+#      post-build validation.
 #   5. For link steps producing libmha_fwd.so / libmha_bwd.so: run the full
-#      post-build (api rewrite, compile, link) to produce the real .so.
+#      post-build (runtime compile + link) to produce the real .so.
 #   6. All other invocations are passed through to the real compiler.
 #
 # The manifest maps blob basenames to their compile commands so the runtime
@@ -286,6 +288,80 @@ def _post_build_for_lib(link_argv, out_so):
 
 
 # ---------------------------------------------------------------------------
+# API source handling: rewrite then compile
+# ---------------------------------------------------------------------------
+
+def _handle_api_source(argv, source_abs, output_abs, basename):
+    """
+    Rewrite the api source via ck_api_rewrite, compile the rewritten file with
+    the same flags (source path and -o substituted), and record the result in
+    the manifest.
+
+    Returns the compiler exit code.
+    """
+    sys.path.insert(0, _THIS_DIR)
+    import ck_api_rewrite as ar
+
+    api_kind = ar.detect_api_kind(basename)
+    if api_kind is None:
+        print(f"[CK-JIT] WARNING: could not detect api_kind for {basename}, "
+              f"falling back to real compiler", file=sys.stderr)
+        return run_real_compiler(argv)
+
+    # Scratch dir: per-lib to avoid races between fwd and bwd api files.
+    lib_tag  = "libmha_bwd" if "fmha_bwd" in basename else "libmha_fwd"
+    build_dir = os.path.join(JIT_TMP_DIR, lib_tag)
+    os.makedirs(build_dir, exist_ok=True)
+
+    stem   = os.path.splitext(basename)[0]
+    rw_src = os.path.join(build_dir, stem + "_jit.cpp")
+
+    n_rw = ar.rewrite_api_file(source_abs, rw_src, api_kind)
+    if n_rw < 0:
+        return 1
+
+    print(f"[CK-JIT] Rewrote api: {basename} ({n_rw} blocks) → {os.path.basename(rw_src)}",
+          file=sys.stderr)
+
+    # Build a new argv: replace compiler and source path; everything else (including
+    # -o) is copied verbatim — subprocess inherits CWD so relative paths are valid.
+    compiler = REAL_COMPILER or _find_hipcc()
+    src_rel  = _rel(source_abs)
+    new_argv = [compiler] + [
+        rw_src if (a in (source_abs, src_rel, source_abs.replace("\\", "/"))
+                   or (os.path.basename(a) == basename and a.endswith((".cpp", ".cu"))))
+        else a
+        for a in argv[1:]
+    ]
+
+    verbose = os.environ.get("CK_JIT_VERBOSE", "0") == "1"
+    if verbose:
+        import shlex
+        print(f"[CK-JIT] api compile: {' '.join(shlex.quote(a) for a in new_argv)}",
+              file=sys.stderr)
+
+    rc = subprocess.run(new_argv).returncode
+    if rc != 0:
+        print(f"[CK-JIT] ERROR: api compile failed for {basename} (rc={rc})", file=sys.stderr)
+        return rc
+
+    entry = {
+        "source":   _rel(rw_src),
+        "output":   _rel(output_abs),
+        "cwd":      _rel(os.getcwd()),
+        "argv":     _relativize_argv(new_argv, rw_src, rw_src, output_abs, output_abs),
+        "kind":     "api",
+        "api_kind": api_kind,
+        "module": (
+            "fmha_fwd" if ("fmha_fwd" in basename or "fmha_batch_prefill" in basename)
+            else "fmha_bwd"
+        ),
+    }
+    append_to_manifest(entry)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -307,32 +383,19 @@ def main():
     # Api files: any fmha_fwd_*_api.{cu,cpp} or fmha_bwd_*_api.{cu,cpp}.
     is_api = INTERCEPT_ALL and _is_api_source(basename)
 
-    # Only blob and api entries are needed in the manifest.
-    # Host objects (mha_fwd.cu etc.) are compiled for real by ninja and
-    # recovered from the link argv at link-step time.
-    if is_blob or is_api:
+    if is_api:
+        return _handle_api_source(argv, source_abs, output_abs, basename)
+
+    if is_blob:
+        # Blobs: record manifest entry, write zero-byte stub (compiled on demand at runtime).
         entry = {
             "source": _rel(source_abs),
             "output": _rel(output_abs),
             "cwd":    _rel(os.getcwd()),
             "argv":   _relativize_argv(argv, source, source_abs, output, output_abs),
-            "is_blob": is_blob,
-            "is_api":  is_api,
-            "module": (
-                "fmha_fwd" if ("fmha_fwd" in basename or "fmha_batch_prefill" in basename) else
-                "fmha_bwd" if "fmha_bwd" in basename else
-                ""
-            ) if is_api else "",
+            "kind":   "blob",
         }
         append_to_manifest(entry)
-
-    if is_api:
-        print(f"[CK-JIT] Intercepted api: {basename} → stub (real compile at link time)",
-              file=sys.stderr)
-        _write_empty_file(output_abs)
-        return 0
-
-    if is_blob:
         print(f"[CK-JIT] Intercepted blob: {basename} → stub", file=sys.stderr)
         _write_empty_file(output_abs)
         return 0

@@ -69,7 +69,7 @@ def _build_index(entries):
     """Return {norm_basename: entry} for all blob entries."""
     index = {}
     for e in entries:
-        if not e.get("is_blob"):
+        if e.get("kind") != "blob":
             continue
         key = _norm_name(e["source"])
         index[key] = e

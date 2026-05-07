@@ -37,7 +37,7 @@ index 355224fe2..a9b0f00a9 100644
 +            inners += (
 +                f"//jit_kernel: {trait.dq_dk_dv_kernel.filename}\n"
 +                f"//jit_dot_do_o_kernel: {trait.dot_do_o_kernel.filename}\n"
-+                f"//jit_convert_dq_kernel: {trait.convert_dq_kernel.filename}\n"
++                f"//jit_convert_dq_kernel: {trait.convert_dq_kernel.filename if not trait.convert_dq_kernel.disabled else ''}\n"
 +            )
              inners += FMHA_BWD_API_INNER_DISPATCH.format(
                  F_if=if_(i_trait),

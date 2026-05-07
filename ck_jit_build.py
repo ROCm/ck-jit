@@ -24,6 +24,8 @@
 #       [--install-dir <path>]  \
 #       [--verbose]
 
+import contextlib
+import fcntl
 import json
 import multiprocessing
 import os
@@ -40,6 +42,29 @@ _TAG = "[CK-JIT]"
 # generated *_api.cpp files carry per-condition kernel name hints.  Stored
 # relative to this script; applied before codegen runs, reverted afterwards.
 _CODEGEN_PATCH = os.path.join(_SCRIPT_DIR, "codegen_jit_hints.patch")
+
+
+# ---------------------------------------------------------------------------
+# Per-aiter exclusive lock
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def ck_build_lock(ck_submodule):
+    """
+    Exclusive file lock scoped to a single CK submodule directory.
+    Prevents concurrent builds sharing the same aiter from racing on
+    codegen patch apply/revert.  Blocks until the lock is acquired.
+    """
+    lock_path = os.path.join(ck_submodule, ".ck_jit_build.lock")
+    with open(lock_path, "w") as lf:
+        print(f"{_TAG} Waiting for build lock ({lock_path})...", file=sys.stderr)
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        print(f"{_TAG} build lock acquired.", file=sys.stderr)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+            print(f"{_TAG} build lock released.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +337,7 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
                 if a.startswith("-I") and not os.path.isabs(a[2:]):
                     include_dirs.add(a[2:])
 
-            if not entry.get("is_blob"):
+            if entry.get("kind") != "blob":
                 continue
 
             src_stored = entry["source"]
@@ -442,16 +467,17 @@ def cmd_full(args):
     })
 
     ck_submodule = os.path.join(aiter_dir, "3rdparty", "composable_kernel")
-    if not _apply_codegen_patch(ck_submodule):
-        if _tmp_owner:
-            shutil.rmtree(_tmp_owner, ignore_errors=True)
-        return 1
+    with ck_build_lock(ck_submodule):
+        if not _apply_codegen_patch(ck_submodule):
+            if _tmp_owner:
+                shutil.rmtree(_tmp_owner, ignore_errors=True)
+            return 1
 
-    print(f"{_TAG} Starting parallel fwd/bwd compilation...", file=sys.stderr)
-    try:
-        rc = _run_parallel_compile(env, compile_py, tmp_dir)
-    finally:
-        _revert_codegen_patch(ck_submodule)
+        print(f"{_TAG} Starting parallel fwd/bwd compilation...", file=sys.stderr)
+        try:
+            rc = _run_parallel_compile(env, compile_py, tmp_dir)
+        finally:
+            _revert_codegen_patch(ck_submodule)
 
     if rc != 0:
         if _tmp_owner:

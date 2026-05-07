@@ -7,11 +7,7 @@
 //
 // The generated fmha_fwd_api.cpp is post-processed by ck_post_build.py
 // (after the full ninja build completes) to replace each direct template
-// dispatch call with:
-//
-//   ck_jit_fwd_call("blob_basename.cu", s, a)                  (fwd)
-//   ck_jit_bwd_dot_do_o_call / ck_jit_bwd_dq_dk_dv_call /
-//   ck_jit_bwd_convert_dq_call("blob_basename.cu", s, a)      (bwd, one call per sub-kernel)
+// dispatch call with: ck_jit_* call
 //
 // On the first call for a given blob:
 //   1. Look up the blob in the compile-time embedded manifest (kEntries).
@@ -53,12 +49,14 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unordered_map>
 #include <unistd.h>
 
@@ -465,21 +463,32 @@ float ck_jit_fwd_splitkv_call(const char* sv_blob,
                                const ck_tile::stream_config& s,
                                fmha_fwd_splitkv_args a)
 {
-    // Resolve splitkv blob (has fmha_fwd_splitkv_oneshot_ symbol).
+    // Resolve both blobs in parallel — each compile_and_load_blob call may
+    // invoke the JIT compiler, so running them concurrently halves cold-start time.
     BlobState* sv_state = get_sv_state(sv_blob);
-    std::call_once(sv_state->init_flag, [&]() {
-        sv_state->fn = compile_and_load_blob(sv_blob, "_Z25fmha_fwd_splitkv_oneshot_I", *sv_state);
+    BlobState* cb_state = get_sv_combine_state(combine_blob);
+
+    std::string sv_blob_s      = sv_blob;
+    std::string combine_blob_s = combine_blob;
+    auto fut_sv = std::async(std::launch::async, [&]() {
+        std::call_once(sv_state->init_flag, [&]() {
+            sv_state->fn = compile_and_load_blob(
+                sv_blob_s, "_Z25fmha_fwd_splitkv_oneshot_I", *sv_state);
+        });
     });
+    auto fut_cb = std::async(std::launch::async, [&]() {
+        std::call_once(cb_state->init_flag, [&]() {
+            cb_state->fn = compile_and_load_blob(
+                combine_blob_s, "_Z33fmha_fwd_splitkv_combine_oneshot_I", *cb_state);
+        });
+    });
+    fut_sv.get();
+    fut_cb.get();
+
     if (!sv_state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: splitkv blob not resolved: %s\n", sv_blob);
         return -1.0f;
     }
-
-    // Resolve combine blob (has fmha_fwd_splitkv_combine_oneshot_ symbol).
-    BlobState* cb_state = get_sv_combine_state(combine_blob);
-    std::call_once(cb_state->init_flag, [&]() {
-        cb_state->fn = compile_and_load_blob(combine_blob, "_Z33fmha_fwd_splitkv_combine_oneshot_I", *cb_state);
-    });
     if (!cb_state->fn) {
         ::fprintf(stderr, "[CK-JIT] ERROR: splitkv combine blob not resolved: %s\n", combine_blob);
         return -1.0f;
@@ -514,62 +523,79 @@ float ck_jit_batch_prefill_call(const char* blob,
 }
 #else
 // ---------------------------------------------------------------------------
-// Bwd per-sub-kernel JIT calls.
-// Each bwd dispatch site calls three of these (dot_do_o, dq_dk_dv, convert_dq).
-// All three sub-kernel blobs return float (via ck_tile::launch_kernel).
+// Bwd JIT call: three blobs per dispatch (dot_do_o, dq_dk_dv, convert_dq).
+// The helper template fmha_bwd_<> is rewritten to call this instead
+// of directly instantiating the blob oneshot_ functions.
 // ---------------------------------------------------------------------------
 
 __attribute__((visibility("hidden")))
-float ck_jit_bwd_dot_do_o_call(const char* blob,
-                                const ck_tile::stream_config& s,
-                                fmha_bwd_args a)
+float ck_jit_bwd_call(const char* dot_do_o_blob,
+                       const char* dq_dk_dv_blob,
+                       const char* convert_dq_blob,
+                       const ck_tile::stream_config& s,
+                       fmha_bwd_args a)
 {
-    BlobState* state = get_bwd_dot_do_o_state(blob);
-    std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z18fmha_bwd_dot_do_o_I", *state);
-    });
-    if (!state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: bwd dot_do_o blob not resolved: %s\n", blob);
-        return -1.0f;
-    }
-    return reinterpret_cast<fn_blob_bwd_t>(state->fn)(s, a);
-}
+    // All three blobs are independent — resolve them in parallel to halve cold-start time.
+    BlobState* dot_state  = get_bwd_dot_do_o_state(dot_do_o_blob);
+    BlobState* dq_state   = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    const bool has_conv   = convert_dq_blob && convert_dq_blob[0];
+    BlobState* conv_state = has_conv ? get_bwd_convert_dq_state(convert_dq_blob) : nullptr;
 
-__attribute__((visibility("hidden")))
-float ck_jit_bwd_dq_dk_dv_call(const char* blob,
-                                const ck_tile::stream_config& s,
-                                fmha_bwd_args a)
-{
-    BlobState* state = get_bwd_dq_dk_dv_state(blob);
-    std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z18fmha_bwd_dq_dk_dv_I", *state);
-    });
-    if (!state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: bwd dq_dk_dv blob not resolved: %s\n", blob);
-        return -1.0f;
-    }
-    return reinterpret_cast<fn_blob_bwd_t>(state->fn)(s, a);
-}
+    std::string dot_blob_s  = dot_do_o_blob;
+    std::string dq_blob_s   = dq_dk_dv_blob;
+    std::string conv_blob_s = has_conv ? convert_dq_blob : "";
 
-__attribute__((visibility("hidden")))
-float ck_jit_bwd_convert_dq_call(const char* blob,
-                                  const ck_tile::stream_config& s,
-                                  fmha_bwd_args a)
-{
-    BlobState* state = get_bwd_convert_dq_state(blob);
-    std::call_once(state->init_flag, [&]() {
-        state->fn = compile_and_load_blob(blob, "_Z20fmha_bwd_convert_dq_I", *state);
+    auto fut_dot = std::async(std::launch::async, [&]() {
+        std::call_once(dot_state->init_flag, [&]() {
+            dot_state->fn = compile_and_load_blob(
+                dot_blob_s, "_Z18fmha_bwd_dot_do_o_I", *dot_state);
+        });
     });
-    if (!state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: bwd convert_dq blob not resolved: %s\n", blob);
+    auto fut_dq = std::async(std::launch::async, [&]() {
+        std::call_once(dq_state->init_flag, [&]() {
+            dq_state->fn = compile_and_load_blob(
+                dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", *dq_state);
+        });
+    });
+    std::future<void> fut_conv;
+    if (conv_state) {
+        fut_conv = std::async(std::launch::async, [&]() {
+            std::call_once(conv_state->init_flag, [&]() {
+                conv_state->fn = compile_and_load_blob(
+                    conv_blob_s, "_Z20fmha_bwd_convert_dq_I", *conv_state);
+            });
+        });
+    }
+    fut_dot.get();
+    fut_dq.get();
+    if (fut_conv.valid()) fut_conv.get();
+
+    if (!dot_state->fn) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: bwd dot_do_o blob not resolved: %s\n", dot_do_o_blob);
         return -1.0f;
     }
-    return reinterpret_cast<fn_blob_bwd_t>(state->fn)(s, a);
+    if (!dq_state->fn) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: bwd dq_dk_dv blob not resolved: %s\n", dq_dk_dv_blob);
+        return -1.0f;
+    }
+
+    if (!has_conv) {
+        return ck_tile::launch_kernel(s,
+            [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dot_state->fn)(s_, a); }},
+            [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dq_state->fn)(s_, a); }}
+        );
+    }
+
+    if (!conv_state->fn) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: bwd convert_dq blob not resolved: %s\n", convert_dq_blob);
+        return -1.0f;
+    }
+    return ck_tile::launch_kernel(s,
+        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dot_state->fn)(s_, a); }},
+        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dq_state->fn)(s_, a); }},
+        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(conv_state->fn)(s_, a); }}
+    );
 }
 #endif
 
 } // extern "C"
-
-// aiter::mha_fwd, mha_bwd, mha_fwd_splitkv, mha_batch_prefill are provided by
-// mha_fwd.cu / mha_bwd.cu compiled and linked into libmha_fwd.so / libmha_bwd.so
-// by ck_post_build.py.  No stubs needed here.
