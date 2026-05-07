@@ -1,0 +1,104 @@
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+index 8c006c09d..517c9ae38 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+@@ -249,6 +249,7 @@ class CppConstraint:
+ 
+ @dataclass
+ class FmhaFwdApiTrait:
++    kernel_filename: str  # for JIT purpose, not used for codegen logic
+     pipeline_tag: str
+     # sync with fmha_fwd_traits<>, to generate fallback calls
+     hdim: str
+@@ -467,6 +468,7 @@ class FmhaFwdApiPool:
+                 inners = str()
+                 for k, trait in enumerate(traits):
+                     if_k = "if" if k == 0 else "else if"
++                    inners = inners + f"//jit_kernel: {trait.kernel_filename}\n"
+                     inners = inners + FMHA_FWD_API_INNER_DISPATCH.format(
+                         F_if=if_k,
+                         F_mode=MODE_MAP[trait.mode],
+@@ -641,6 +643,7 @@ class FmhaFwdKernel:
+ 
+     def api_trait(self) -> FmhaFwdApiTrait:
+         return FmhaFwdApiTrait(
++            kernel_filename=self.filename,
+             pipeline_tag=self.F_pipeline.tag,
+             hdim=str(self.F_hdim),
+             dtype=self.F_dtype,
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_bwd.py b/example/ck_tile/01_fmha/codegen/ops/fmha_bwd.py
+index 7105f1aa5..7bcd61ebf 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_bwd.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_bwd.py
+@@ -925,7 +925,12 @@ class FmhaBwdApiPool:
+         inners = ""
+         inners_launcher = ""
+         for i_trait, trait in enumerate(traits):
+-            inners_common = FMHA_BWD_API_INNER_DISPATCH_COMMON.format(
++            inners_common = (
++                f"//jit_kernel: {trait.dq_dk_dv_kernel.filename}\n"
++                f"//jit_dot_do_o_kernel: {trait.dot_do_o_kernel.filename}\n"
++                f"//jit_convert_dq_kernel: {trait.convert_dq_kernel.filename if not trait.convert_dq_kernel.disabled else ''}\n"
++            )
++            inners_common += FMHA_BWD_API_INNER_DISPATCH_COMMON.format(
+                 F_if=if_(i_trait),
+                 F_mode=MODE_MAP[trait.mode],
+                 F_mask_check=get_mask_check_map(self.mask_impl)[trait.mask],
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py b/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
+index c64a19104..a4a8356a3 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
+@@ -272,6 +272,7 @@ class CppConstraint:
+ 
+ @dataclass
+ class FmhaFwdApiTrait:
++    kernel_filename: str  # for JIT purpose, not used for codegen logic
+     arch: ArchTrait
+     pipeline_tag: str
+     # sync with fmha_fwd_traits<>, to generate fallback calls
+@@ -561,6 +562,7 @@ class FmhaFwdApiPool:
+                     for i_trait, trait in enumerate(
+                         [trait for trait in pool_by_hdim if filter_fn(trait)]
+                     ):
++                        inners += f"//jit_kernel: {trait.kernel_filename}\n"
+                         inners += FMHA_FWD_API_INNER_DISPATCH.format(
+                             F_if=if_(i_trait),
+                             F_arch=arch,
+@@ -747,6 +749,7 @@ class FmhaFwdKernel:
+ 
+     def api_trait(self) -> FmhaFwdApiTrait:
+         return FmhaFwdApiTrait(
++            kernel_filename=self.filename,
+             arch=self.F_arch,
+             pipeline_tag=self.F_pipeline.tag,
+             hdim=str(self.F_hdim),
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_fwd_splitkv.py b/example/ck_tile/01_fmha/codegen/ops/fmha_fwd_splitkv.py
+index c9bac50da..58f2adcc0 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_fwd_splitkv.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_fwd_splitkv.py
+@@ -310,6 +310,8 @@ FMHA_FWD_SPLITKV_API_INNER_DISPATCH = """{F_if}((t.is_group_mode == {F_mode}) &&
+ 
+ @dataclass
+ class FmhaFwdSplitKVApiTrait:
++    kernel_filename: str  # for JIT purpose, not used for codegen logic
++    combine_filename: str  # for JIT purpose, not used for codegen logic
+     arch: ArchTrait
+     pipeline_tag: str
+     # sync with fmha_fwd_traits<>, to generate fallback calls
+@@ -560,6 +562,7 @@ class FmhaFwdSplitKVApiPool:
+                 for i_hdim, (hdim, pool_by_hdim) in enumerate(pool_by_dtype.items()):
+                     inners = str()
+                     for i_trait, trait in enumerate(pool_by_hdim):
++                        inners += f"//jit_kernel: {trait.kernel_filename}\n//jit_combine_kernel: {trait.combine_filename}\n"
+                         inners += FMHA_FWD_SPLITKV_API_INNER_DISPATCH.format(
+                             F_if=if_(i_trait),
+                             F_arch=arch,
+@@ -1093,6 +1096,8 @@ def write_blobs(
+         combine_kernel = combine_ks[0]
+         api_pool.register_traits(
+             FmhaFwdSplitKVApiTrait(
++                kernel_filename=kernel.filename,
++                combine_filename=combine_kernel.filename,
+                 arch=kernel.F_arch,
+                 pipeline_tag=kernel.F_pipeline.tag,
+                 hdim=kernel.F_hdim,

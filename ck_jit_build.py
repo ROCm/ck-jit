@@ -38,10 +38,63 @@ import tempfile
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TAG = "[CK-JIT]"
 
-# Patch that adds //jit_kernel: comments to the CK codegen scripts so that
-# generated *_api.cpp files carry per-condition kernel name hints.  Stored
-# relative to this script; applied before codegen runs, reverted afterwards.
-_CODEGEN_PATCH = os.path.join(_SCRIPT_DIR, "codegen_jit_hints.patch")
+# Patches that add //jit_kernel: comments to the CK codegen scripts.
+# Two variants exist because fmha_bwd.py underwent a structural change:
+#   _v1: monolithic FMHA_BWD_API_INNER_DISPATCH  (CK ≤ b09112bb, e.g. aiter)
+#   _v2: split _COMMON/_RUN/_LAUNCHER templates   (CK ≥ b09112bb, e.g. aiter.2)
+# The first commit that introduced the launcher template in codegen/ops:
+_LAUNCHER_COMMIT = "b09112bbad1d5bbacd0e2e0ad15a60fd8bc7e488"
+_CODEGEN_PATCH_V1 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_0cafa68b6.patch")
+_CODEGEN_PATCH_V2 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_fdf4bb7fc.patch")
+_CODEGEN_OPS_PATH = "example/ck_tile/01_fmha/codegen/ops"
+
+
+def _select_codegen_patch(ck_submodule):
+    """
+    Return the correct patch path for the given CK submodule by inspecting the
+    git commit of the codegen/ops directory.
+
+    Uses the commit date to determine whether the launcher-based bwd template
+    (introduced in _LAUNCHER_COMMIT) is present, so the comparison is
+    chronological rather than a linear-ancestry check (works across forks).
+
+    Falls back to string-probing fmha_bwd.py if git is unavailable.
+    """
+    def _git_commit_date(ck_dir, ref):
+        r = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", ref, "--"],
+            cwd=ck_dir, capture_output=True, text=True,
+        )
+        return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+    ops_commit_r = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", _CODEGEN_OPS_PATH],
+        cwd=ck_submodule, capture_output=True, text=True,
+    )
+    if ops_commit_r.returncode == 0 and ops_commit_r.stdout.strip():
+        ops_commit = ops_commit_r.stdout.strip()
+        ops_ts      = _git_commit_date(ck_submodule, ops_commit)
+        launcher_ts = _git_commit_date(ck_submodule, _LAUNCHER_COMMIT)
+
+        if ops_ts is not None and launcher_ts is not None:
+            patch = _CODEGEN_PATCH_V2 if ops_ts >= launcher_ts else _CODEGEN_PATCH_V1
+            patch_commit = "fdf4bb7fc" if patch == _CODEGEN_PATCH_V2 else "0cafa68b6"
+            print(f"{_TAG} codegen/ops commit {ops_commit[:9]}: using patch {patch_commit}",
+                  file=sys.stderr)
+            return patch
+
+    # Fallback: string-probe fmha_bwd.py when git timestamps are unavailable.
+    bwd_py = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "fmha_bwd.py")
+    try:
+        with open(bwd_py) as f:
+            has_launcher = "FMHA_BWD_API_INNER_DISPATCH_LAUNCHER" in f.read()
+    except OSError:
+        has_launcher = False
+    patch = _CODEGEN_PATCH_V2 if has_launcher else _CODEGEN_PATCH_V1
+    patch_commit = "fdf4bb7fc" if has_launcher else "0cafa68b6"
+    print(f"{_TAG} git unavailable; selected patch {patch_commit} by string probe",
+          file=sys.stderr)
+    return patch
 
 
 # ---------------------------------------------------------------------------
@@ -71,23 +124,23 @@ def ck_build_lock(ck_submodule):
 # Codegen patch apply / revert
 # ---------------------------------------------------------------------------
 
-def _apply_codegen_patch(codegen_dir):
-    """Apply codegen_jit_hints.patch to the CK codegen ops directory.
+def _apply_codegen_patch(codegen_dir, patch_path):
+    """Apply patch_path to the CK codegen ops directory.
 
-    codegen_dir — path to the composable_kernel submodule root (the directory
-    that contains example/ck_tile/01_fmha/codegen/ops/).
+    codegen_dir — path to the composable_kernel submodule root.
+    patch_path  — absolute path to the .patch file to apply.
 
     Fails atomically: a dry-run is performed first so that no .rej files or
     partial modifications are written when the patch cannot be applied cleanly.
 
     Returns True on success, False if patch could not be applied.
     """
-    if not os.path.exists(_CODEGEN_PATCH):
-        print(f"{_TAG} ERROR: codegen patch not found: {_CODEGEN_PATCH}",
+    if not os.path.exists(patch_path):
+        print(f"{_TAG} ERROR: codegen patch not found: {patch_path}",
               file=sys.stderr)
         return False
 
-    base_cmd = ["patch", "-p1", "--forward", "--input", _CODEGEN_PATCH]
+    base_cmd = ["patch", "-p1", "--forward", "--input", patch_path]
 
     # Dry-run first — no files are written, no .rej files created.
     dry = subprocess.run(
@@ -113,12 +166,12 @@ def _apply_codegen_patch(codegen_dir):
     return True
 
 
-def _revert_codegen_patch(codegen_dir):
-    """Revert codegen_jit_hints.patch from the CK codegen ops directory."""
-    if not os.path.exists(_CODEGEN_PATCH):
+def _revert_codegen_patch(codegen_dir, patch_path):
+    """Revert patch_path from the CK codegen ops directory."""
+    if not os.path.exists(patch_path):
         return
     r = subprocess.run(
-        ["patch", "-p1", "--reverse", "--input", _CODEGEN_PATCH],
+        ["patch", "-p1", "--reverse", "--input", patch_path],
         cwd=codegen_dir, capture_output=True, text=True,
     )
     if r.returncode != 0:
@@ -468,7 +521,8 @@ def cmd_full(args):
 
     ck_submodule = os.path.join(aiter_dir, "3rdparty", "composable_kernel")
     with ck_build_lock(ck_submodule):
-        if not _apply_codegen_patch(ck_submodule):
+        patch = _select_codegen_patch(ck_submodule)
+        if not _apply_codegen_patch(ck_submodule, patch):
             if _tmp_owner:
                 shutil.rmtree(_tmp_owner, ignore_errors=True)
             return 1
@@ -477,7 +531,7 @@ def cmd_full(args):
         try:
             rc = _run_parallel_compile(env, compile_py, tmp_dir)
         finally:
-            _revert_codegen_patch(ck_submodule)
+            _revert_codegen_patch(ck_submodule, patch)
 
     if rc != 0:
         if _tmp_owner:

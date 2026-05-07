@@ -180,14 +180,27 @@ def rewrite_api_file(src_path, dst_path, api_kind):
             indent = line[: len(line) - len(line.lstrip())]
 
             if is_bwd:
-                if stripped.startswith("r = fmha_bwd_<"):
+                bwd_prefix = ("r = " if stripped.startswith("r = fmha_bwd_<")
+                              else "return " if stripped.startswith("return fmha_bwd_<")
+                              else None)
+                if bwd_prefix is not None:
                     if f"std::conditional_t<{'true' if pending_conv else 'false'}" not in stripped:
                         print(f"[CK-POST] ERROR: unexpected bwd dispatch format (invalid convert_dq check) in {src_path}:{line}",
                                 file=sys.stderr)
                         return -1
                     out_lines.append(
-                        f'{indent}r = ck_jit_bwd_call("{pending_dot}", '
+                        f'{indent}{bwd_prefix}ck_jit_bwd_call("{pending_dot}", '
                         f'"{pending_kernel}", "{pending_conv}", s, a);')
+                    n_rewritten += 1
+                    continue
+                if stripped.startswith("dq_acc_splits = fmha_bwd_dq_dk_dv_dq_acc_splits_<"):
+                    out_lines.append(
+                        f'{indent}dq_acc_splits = ck_jit_bwd_dq_acc_splits("{pending_kernel}", t);')
+                    n_rewritten += 1
+                    continue
+                if stripped.startswith("needs_zero_dq_acc = fmha_bwd_dq_dk_dv_needs_zero_dq_acc_<"):
+                    out_lines.append(
+                        f'{indent}needs_zero_dq_acc = ck_jit_bwd_needs_zero_dq_acc("{pending_kernel}");')
                     n_rewritten += 1
                     continue
 
@@ -242,7 +255,9 @@ def rewrite_api_file(src_path, dst_path, api_kind):
     # ------------------------------------------------------------------
     _sc = "const ck_tile::stream_config&"
     decl_map = {
-        "bwd":          f"float ck_jit_bwd_call(const char*, const char*, const char*, {_sc}, fmha_bwd_args);\n",
+        "bwd":          (f"float ck_jit_bwd_call(const char*, const char*, const char*, {_sc}, fmha_bwd_args);\n"
+                         "int  ck_jit_bwd_dq_acc_splits(const char*, const fmha_bwd_traits&);\n"
+                         "bool ck_jit_bwd_needs_zero_dq_acc(const char*);\n"),
         "fwd_splitkv":  f"float ck_jit_fwd_splitkv_call(const char*, const char*, {_sc}, fmha_fwd_splitkv_args);\n",
         "batch_prefill":f"float ck_jit_batch_prefill_call(const char*, {_sc}, fmha_batch_prefill_args);\n",
         "fwd":          f"float ck_jit_fwd_call(const char*, {_sc}, fmha_fwd_args);\n",

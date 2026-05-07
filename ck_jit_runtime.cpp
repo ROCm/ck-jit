@@ -66,14 +66,6 @@
 // Types matching the blob function signatures (stream_config first, args second).
 // Note: mha_fwd.h's aiter::mha_fwd takes (args, stream) but the CK blob
 // specialisations take (stream, args) — they are different call conventions.
-// ---------------------------------------------------------------------------
-#if CK_JIT_IS_FWD
-using fn_blob_fwd_t    = float (*)(const ck_tile::stream_config&, fmha_fwd_args);
-using fn_blob_sv_t     = void  (*)(const ck_tile::stream_config&, fmha_fwd_splitkv_args);
-using fn_blob_bp_t     = float (*)(const ck_tile::stream_config&, fmha_batch_prefill_args);
-#else
-using fn_blob_bwd_t    = float (*)(const ck_tile::stream_config&, fmha_bwd_args);
-#endif
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -117,25 +109,16 @@ struct BlobState {
     void*           handle = nullptr;  // dlopen handle
 };
 
-// Global maps: blob_basename -> state
-// Protected by a shared_mutex for read-heavy access after warm-up.
-#if CK_JIT_IS_FWD
-std::shared_mutex         g_fwd_mtx;
-std::shared_mutex         g_sv_mtx;
-std::shared_mutex         g_sv_combine_mtx;
-std::shared_mutex         g_bp_mtx;
-std::unordered_map<std::string, BlobState*> g_fwd_blobs;
-std::unordered_map<std::string, BlobState*> g_sv_blobs;
-std::unordered_map<std::string, BlobState*> g_sv_combine_blobs;
-std::unordered_map<std::string, BlobState*> g_bp_blobs;
-#else
-std::shared_mutex         g_bwd_dot_do_o_mtx;
-std::shared_mutex         g_bwd_dq_dk_dv_mtx;
-std::shared_mutex         g_bwd_convert_dq_mtx;
-std::unordered_map<std::string, BlobState*> g_bwd_dot_do_o_blobs;
-std::unordered_map<std::string, BlobState*> g_bwd_dq_dk_dv_blobs;
-std::unordered_map<std::string, BlobState*> g_bwd_convert_dq_blobs;
-#endif
+// Extended state for dq_dk_dv blobs: carries the two host-side metadata
+// functions in addition to the kernel fn.  meta_init_flag is separate from
+// init_flag so that ck_jit_bwd_call and ck_jit_bwd_dq_acc_splits can race
+// to fire their respective once_flags independently.
+struct BwdDqBlobState : BlobState {
+    std::once_flag  meta_init_flag;
+    void*           fn_splits   = nullptr;  // fmha_bwd_dq_dk_dv_dq_acc_splits_<>
+    void*           fn_zero_acc = nullptr;  // fmha_bwd_dq_dk_dv_needs_zero_dq_acc_<>
+};
+
 
 #ifndef CK_JIT_NAME
 #  define CK_JIT_NAME "ck_jit"
@@ -368,11 +351,12 @@ static void* compile_and_load_blob(const std::string& blob_basename,
 }
 
 // ---------------------------------------------------------------------------
-// Get-or-create BlobState for a blob name.
+// Get-or-create a State object for a blob name.
 // ---------------------------------------------------------------------------
-static BlobState* _get_state(std::shared_mutex& mtx,
-                             std::unordered_map<std::string, BlobState*>& map,
-                             const char* blob)
+template <typename State>
+static State* _get_state(std::shared_mutex& mtx,
+                         std::unordered_map<std::string, State*>& map,
+                         const char* blob)
 {
     std::string key(blob);
     {
@@ -382,39 +366,53 @@ static BlobState* _get_state(std::shared_mutex& mtx,
     }
     std::unique_lock lk(mtx);
     auto& ptr = map[key];
-    if (!ptr) ptr = new BlobState();
+    if (!ptr) ptr = new State();
     return ptr;
 }
 
 #if CK_JIT_IS_FWD
 static BlobState* get_fwd_state(const char* blob)
 {
-    return _get_state(g_fwd_mtx, g_fwd_blobs, blob);
+    static std::shared_mutex mtx;
+    static std::unordered_map<std::string, BlobState*> map;
+    return _get_state(mtx, map, blob);
 }
 static BlobState* get_sv_state(const char* blob)
 {
-    return _get_state(g_sv_mtx, g_sv_blobs, blob);
+    static std::shared_mutex mtx;
+    static std::unordered_map<std::string, BlobState*> map;
+    return _get_state(mtx, map, blob);
 }
 static BlobState* get_sv_combine_state(const char* blob)
 {
-    return _get_state(g_sv_combine_mtx, g_sv_combine_blobs, blob);
+    static std::shared_mutex mtx;
+    static std::unordered_map<std::string, BlobState*> map;
+    return _get_state(mtx, map, blob);
 }
 static BlobState* get_bp_state(const char* blob)
 {
-    return _get_state(g_bp_mtx, g_bp_blobs, blob);
+    static std::shared_mutex mtx;
+    static std::unordered_map<std::string, BlobState*> map;
+    return _get_state(mtx, map, blob);
 }
 #else
 static BlobState* get_bwd_dot_do_o_state(const char* blob)
 {
-    return _get_state(g_bwd_dot_do_o_mtx, g_bwd_dot_do_o_blobs, blob);
+    static std::shared_mutex mtx;
+    static std::unordered_map<std::string, BlobState*> map;
+    return _get_state(mtx, map, blob);
 }
-static BlobState* get_bwd_dq_dk_dv_state(const char* blob)
+static BwdDqBlobState* get_bwd_dq_dk_dv_state(const char* blob)
 {
-    return _get_state(g_bwd_dq_dk_dv_mtx, g_bwd_dq_dk_dv_blobs, blob);
+    static std::shared_mutex mtx;
+    static std::unordered_map<std::string, BwdDqBlobState*> map;
+    return _get_state(mtx, map, blob);
 }
 static BlobState* get_bwd_convert_dq_state(const char* blob)
 {
-    return _get_state(g_bwd_convert_dq_mtx, g_bwd_convert_dq_blobs, blob);
+    static std::shared_mutex mtx;
+    static std::unordered_map<std::string, BlobState*> map;
+    return _get_state(mtx, map, blob);
 }
 #endif
 
@@ -440,6 +438,7 @@ float ck_jit_fwd_call(const char* blob,
                       const ck_tile::stream_config& s,
                       fmha_fwd_args a)
 {
+    using fn_t = float (*)(const ck_tile::stream_config&, fmha_fwd_args);
     BlobState* state = get_fwd_state(blob);
     std::call_once(state->init_flag, [&]() {
         state->fn = compile_and_load_blob(blob, "_Z9fmha_fwd_I", *state);
@@ -448,7 +447,7 @@ float ck_jit_fwd_call(const char* blob,
         ::fprintf(stderr, "[CK-JIT] ERROR: fwd blob not resolved: %s\n", blob);
         return -1.0f;
     }
-    return reinterpret_cast<fn_blob_fwd_t>(state->fn)(s, a);
+    return reinterpret_cast<fn_t>(state->fn)(s, a);
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +462,7 @@ float ck_jit_fwd_splitkv_call(const char* sv_blob,
                                const ck_tile::stream_config& s,
                                fmha_fwd_splitkv_args a)
 {
+    using fn_t = void (*)(const ck_tile::stream_config&, fmha_fwd_splitkv_args);
     // Resolve both blobs in parallel — each compile_and_load_blob call may
     // invoke the JIT compiler, so running them concurrently halves cold-start time.
     BlobState* sv_state = get_sv_state(sv_blob);
@@ -497,9 +497,9 @@ float ck_jit_fwd_splitkv_call(const char* sv_blob,
     // Replicate what fmha_fwd_splitkv_<> does: launch_kernel with two lambdas.
     return ck_tile::launch_kernel(s,
         [&](const ck_tile::stream_config& s_){
-            reinterpret_cast<fn_blob_sv_t>(sv_state->fn)(s_, a); },
+            reinterpret_cast<fn_t>(sv_state->fn)(s_, a); },
         [&](const ck_tile::stream_config& s_){
-            reinterpret_cast<fn_blob_sv_t>(cb_state->fn)(s_, a); });
+            reinterpret_cast<fn_t>(cb_state->fn)(s_, a); });
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +511,7 @@ float ck_jit_batch_prefill_call(const char* blob,
                                  const ck_tile::stream_config& s,
                                  fmha_batch_prefill_args a)
 {
+    using fn_t = float (*)(const ck_tile::stream_config&, fmha_batch_prefill_args);
     BlobState* state = get_bp_state(blob);
     std::call_once(state->init_flag, [&]() {
         state->fn = compile_and_load_blob(blob, "_Z19fmha_batch_prefill_I", *state);
@@ -519,7 +520,7 @@ float ck_jit_batch_prefill_call(const char* blob,
         ::fprintf(stderr, "[CK-JIT] ERROR: batch_prefill blob not resolved: %s\n", blob);
         return -1.0f;
     }
-    return reinterpret_cast<fn_blob_bp_t>(state->fn)(s, a);
+    return reinterpret_cast<fn_t>(state->fn)(s, a);
 }
 #else
 // ---------------------------------------------------------------------------
@@ -535,9 +536,10 @@ float ck_jit_bwd_call(const char* dot_do_o_blob,
                        const ck_tile::stream_config& s,
                        fmha_bwd_args a)
 {
+    using fn_t = float (*)(const ck_tile::stream_config&, fmha_bwd_args);
     // All three blobs are independent — resolve them in parallel to halve cold-start time.
     BlobState* dot_state  = get_bwd_dot_do_o_state(dot_do_o_blob);
-    BlobState* dq_state   = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    BwdDqBlobState* dq_state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     const bool has_conv   = convert_dq_blob && convert_dq_blob[0];
     BlobState* conv_state = has_conv ? get_bwd_convert_dq_state(convert_dq_blob) : nullptr;
 
@@ -581,8 +583,8 @@ float ck_jit_bwd_call(const char* dot_do_o_blob,
 
     if (!has_conv) {
         return ck_tile::launch_kernel(s,
-            [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dot_state->fn)(s_, a); }},
-            [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dq_state->fn)(s_, a); }}
+            [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_t>(dot_state->fn)(s_, a); }},
+            [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_t>(dq_state->fn)(s_, a); }}
         );
     }
 
@@ -591,10 +593,68 @@ float ck_jit_bwd_call(const char* dot_do_o_blob,
         return -1.0f;
     }
     return ck_tile::launch_kernel(s,
-        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dot_state->fn)(s_, a); }},
-        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(dq_state->fn)(s_, a); }},
-        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_blob_bwd_t>(conv_state->fn)(s_, a); }}
+        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_t>(dot_state->fn)(s_, a); }},
+        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_t>(dq_state->fn)(s_, a); }},
+        [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_t>(conv_state->fn)(s_, a); }}
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bwd metadata: dq_acc_splits and needs_zero_dq_acc.
+// Both symbols live in the dq_dk_dv blob; we resolve them on first call by
+// scanning .dynsym with find_sym_by_prefix, reusing the handle already opened
+// by ck_jit_bwd_call (or opening it now if called first).
+// ---------------------------------------------------------------------------
+
+static void resolve_bwd_dq_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state)
+{
+    std::string dq_blob_s(dq_dk_dv_blob);
+    std::call_once(state.init_flag, [&]() {
+        state.fn = compile_and_load_blob(
+            dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", state);
+    });
+    std::call_once(state.meta_init_flag, [&]() {
+        if (!state.handle) return;
+        // Reconstruct the so_path the same way compile_and_load_blob does.
+        std::string safe = dq_blob_s;
+        for (char& c : safe) if (c == '/' || c == '\\') c = '_';
+        for (const char* ext : {".cpp", ".cu"})
+            if (safe.size() > std::strlen(ext) &&
+                safe.compare(safe.size()-std::strlen(ext), std::strlen(ext), ext) == 0)
+            { safe.resize(safe.size()-std::strlen(ext)); break; }
+        std::string so_path = g_cache_dir + "/" + safe + ".so";
+        state.fn_splits   = find_sym_by_prefix(state.handle, so_path.c_str(),
+                                               "_Z32fmha_bwd_dq_dk_dv_dq_acc_splits_I");
+        state.fn_zero_acc = find_sym_by_prefix(state.handle, so_path.c_str(),
+                                               "_Z36fmha_bwd_dq_dk_dv_needs_zero_dq_acc_I");
+    });
+}
+
+__attribute__((visibility("hidden")))
+int ck_jit_bwd_dq_acc_splits(const char* dq_dk_dv_blob,
+                               const fmha_bwd_traits& t)
+{
+    BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
+    if (!state->fn_splits) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: dq_acc_splits symbol not found in %s\n", dq_dk_dv_blob);
+        return 1;
+    }
+    using fn_t = int (*)(const fmha_bwd_traits&);
+    return reinterpret_cast<fn_t>(state->fn_splits)(t);
+}
+
+__attribute__((visibility("hidden")))
+bool ck_jit_bwd_needs_zero_dq_acc(const char* dq_dk_dv_blob)
+{
+    BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
+    if (!state->fn_zero_acc) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: needs_zero_dq_acc symbol not found in %s\n", dq_dk_dv_blob);
+        return true;
+    }
+    using fn_t = bool (*)();
+    return reinterpret_cast<fn_t>(state->fn_zero_acc)();
 }
 #endif
 
