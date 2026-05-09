@@ -374,7 +374,7 @@ def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
     verbose       : print full compile commands
     """
     lib_name = os.path.basename(out_so)
-    is_fwd   = lib_name == "libmha_fwd.so"
+    is_fwd   = "libmha_fwd" in lib_name
     tag      = "[CK-POST]"
 
     print(f"{tag} Building {lib_name}...", file=sys.stderr)
@@ -402,8 +402,11 @@ def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
         root, ck_include, aiter_include, rocm_include, rocm_lib_dir)
 
     # ---- Scratch dirs (per-lib to avoid ck_jit_runtime.o races) ----
+    # Use canonical name for build_dir so ck_jit_build.py can find the state
+    # file regardless of the output lib name (e.g. te_libmha_fwd.so → libmha_fwd).
     lib_name  = os.path.splitext(os.path.basename(out_so))[0]
-    build_dir = os.path.join(jit_tmp_dir, lib_name)
+    lib_canon = "libmha_fwd" if "libmha_fwd" in lib_name else "libmha_bwd"
+    build_dir = os.path.join(jit_tmp_dir, lib_canon)
     obj_dir   = os.path.join(build_dir, "objs")
     os.makedirs(obj_dir, exist_ok=True)
 

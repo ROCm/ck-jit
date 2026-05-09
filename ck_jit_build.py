@@ -261,8 +261,12 @@ def _create_fake_rocm(real_rocm, tmp_dir, interceptor):
 def _run_compile(env, compile_py, api, log_path):
     """Run compile.py --api <api>, stream output to log_path. Returns rc."""
     with open(log_path, "w") as lf:
+        if isinstance(compile_py, (str, os.PathLike)):
+            compile_py = [compile_py]
+        else:
+            compile_py = list(compile_py)
         r = subprocess.run(
-            [sys.executable, compile_py, "--api", api],
+            [sys.executable] + compile_py + ["--api", api],
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
@@ -276,6 +280,7 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
     Print captured output to stderr.
     Returns 0 on success, 1 if either failed.
     """
+    print(f"{_TAG} Starting parallel fwd/bwd compilation...", file=sys.stderr)
     log_fwd = os.path.join(tmp_dir, "compile_fwd.log")
     log_bwd = os.path.join(tmp_dir, "compile_bwd.log")
 
@@ -305,6 +310,34 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
         print(f"{_TAG} ERROR: bwd compile failed (rc={rc_bwd})", file=sys.stderr)
         rc = 1
     return rc
+
+
+def _run_qola_compile(env, qola_dir, qola_manifest, aiter_dir, tmp_dir, gpu_archs):
+    env["PYTHONPATH"] = os.pathsep.join([os.path.abspath(qola_dir), env.get("PYTHONPATH", "")])
+    log = os.path.join(tmp_dir, "qola_build.log")
+    with open(log, "w") as lf:
+        r = subprocess.run(
+            [sys.executable, "-m", "qola.cli", "build",
+            "--manifest", qola_manifest,
+            "--aiter-root", aiter_dir,
+            "--output-dir", os.path.join(tmp_dir, "qola"),
+            "--arch", gpu_archs,
+            ],
+            env=env,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+        )
+    if r.returncode != 0:
+        print(f"{_TAG} ERROR: qola compile failed (rc={r.returncode})", file=sys.stderr)
+        print(f"{_TAG} === qola compile output ===", file=sys.stderr)
+        try:
+            with open(log) as f:
+                sys.stderr.write(f.read())
+        except OSError:
+            pass
+        return 1
+    return 0
+
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +433,11 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
             else:
                 src_rel = src_stored
                 src_abs = os.path.join(aiter_dir, src_rel)
+            # If src is outside aiter_dir the relpath escapes with ".." and
+            # joining it back to jit_dir resolves to the original file.
+            # Fall back to a tmp_dir-relative path in that case.
+            if src_rel.startswith(".."):
+                src_rel = os.path.relpath(src_abs, tmp_dir)
             dst = os.path.join(jit_dir, src_rel)
             if not os.path.exists(src_abs):
                 print(f"{_TAG} WARNING: blob source not found: {src_abs}", file=sys.stderr)
@@ -442,6 +480,10 @@ def cmd_full(args):
     ck_tile_bf16  = args.ck_tile_bf16
     install_dir   = args.install_dir
     tmp_dir       = args.tmp_dir
+    use_qola      = args.with_qola
+    if use_qola:
+        qola_dir      = args.qola_dir
+        qola_manifest = args.qola_manifest
 
     interceptor  = os.path.join(_SCRIPT_DIR, "ck_build_interceptor.py")
     runtime_src  = os.path.join(_SCRIPT_DIR, "ck_jit_runtime.cpp")
@@ -527,9 +569,11 @@ def cmd_full(args):
                 shutil.rmtree(_tmp_owner, ignore_errors=True)
             return 1
 
-        print(f"{_TAG} Starting parallel fwd/bwd compilation...", file=sys.stderr)
         try:
-            rc = _run_parallel_compile(env, compile_py, tmp_dir)
+            if use_qola:
+                rc = _run_qola_compile(env, qola_dir, qola_manifest, aiter_dir, tmp_dir, gpu_archs)
+            else:
+                rc = _run_parallel_compile(env, compile_py, tmp_dir)
         finally:
             _revert_codegen_patch(ck_submodule, patch)
 
@@ -617,6 +661,12 @@ def main():
                     help="Build-time scratch dir (auto-created temp if omitted).")
     jp.add_argument("--install-dir",  default="",
                     help="Install libs and JIT artifacts here.")
+    jp.add_argument("--with-qola", action="store_true", default=False,
+                    help="Use QoLA instead of aiter compile.py for the build.")
+    jp.add_argument("--qola-dir", default="",
+                    help="Path to QoLA root (required with --with-qola).")
+    jp.add_argument("--qola-manifest", default="",
+                    help="Path to QoLA manifest .toml (default: qola_manifest.toml next to this script).")
 
     # ---- quick ----
     qp = sub.add_parser("quick",
@@ -632,6 +682,12 @@ def main():
     args = ap.parse_args()
 
     if args.command == "full":
+        if args.with_qola and (not args.qola_dir or not args.qola_manifest):
+            print(
+                f"{_TAG} ERROR: --with-qola requires --qola-dir and --qola-manifest.",
+                file=sys.stderr,
+            )
+            return 1
         sys.exit(cmd_full(args))
     elif args.command == "quick":
         sys.exit(cmd_quick(args))

@@ -58,8 +58,11 @@ ROOT            = os.environ.get("CK_JIT_AITER_DIR", "")
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Names of the output shared libraries we intercept the link step for.
-_TARGET_LIBS = {"libmha_fwd.so", "libmha_bwd.so"}
+# Regex matching any variant of the mha shared libraries we intercept the link step for:
+#   libmha_{fwd|bwd}.so          (plain)
+#   <prefix>_libmha_{fwd|bwd}.so  (namespace prefix, e.g. te_libmha_fwd.so)
+#   libmha_{fwd|bwd}_<suffix>.so  (suffix variant)
+_TARGET_LIB_RE = re.compile(r'^(?:.+_)?libmha_(fwd|bwd)(?:_.+)?\.so$')
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +253,11 @@ def run_real_compiler(argv):
 def _handle_link_step(argv):
     """
     Called when hipcc is invoked without -c (i.e. a link step).
-    If -o names libmha_fwd.so or libmha_bwd.so, run the full post-build.
+    If -o matches libmha_{fwd|bwd}.so (with optional prefix/suffix), run the full post-build.
     Otherwise forward to the real linker.
     """
     out_so = _find_arg(argv, "-o")
-    if out_so and os.path.basename(out_so) in _TARGET_LIBS:
+    if out_so and _TARGET_LIB_RE.match(os.path.basename(out_so)):
         return _post_build_for_lib(argv, out_so)
     return run_real_compiler(argv)
 
