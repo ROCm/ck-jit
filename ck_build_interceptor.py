@@ -81,24 +81,35 @@ def _is_api_source(basename):
     return bool(re.match(r'fmha_(fwd|bwd|batch_prefill).*_api\.(cu|cpp)$', basename))
 
 
-def _relativize_argv(argv, source, source_abs, output, output_abs):
+_DROP_FLAGS = frozenset({"-c", "-fvisibility=hidden", "-fvisibility-inlines-hidden"})
+
+def _extract_flags(argv, source, source_abs, output, output_abs):
     """
-    Return argv[1:] with paths under ROOT made relative to ROOT.
-    argv[0] (compiler binary) is dropped — always substituted at use time.
-    Handles: source, output, -I<path>, -isystem<path>.
+    Return compile flags from argv[1:] with:
+      - compiler binary (argv[0]) dropped — substituted at use time
+      - source file, -o <output>, -c, and visibility flags removed
+      - -I / -isystem paths relativized to ROOT
+    The result is stored as the 'argv' (flags-only) field in the manifest.
     """
     result = []
-    for a in argv[1:]:
-        if a in (source, source_abs):
-            result.append(_rel(source_abs))
-        elif a in (output, output_abs):
-            result.append(_rel(output_abs))
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in (source, source_abs, output, output_abs):
+            i += 1
+        elif a == "-o" and i + 1 < len(argv):
+            i += 2
+        elif a in _DROP_FLAGS:
+            i += 1
         elif a.startswith("-I"):
             result.append("-I" + _rel(a[2:]))
+            i += 1
         elif a.startswith("-isystem"):
             result.append("-isystem" + _rel(a[len("-isystem"):]))
+            i += 1
         else:
             result.append(a)
+            i += 1
     return result
 
 
@@ -349,16 +360,10 @@ def _handle_api_source(argv, source_abs, output_abs, basename):
         return rc
 
     entry = {
-        "source":   _rel(rw_src),
-        "output":   _rel(output_abs),
-        "cwd":      _rel(os.getcwd()),
-        "argv":     _relativize_argv(new_argv, rw_src, rw_src, output_abs, output_abs),
-        "kind":     "api",
-        "api_kind": api_kind,
-        "module": (
-            "fmha_fwd" if ("fmha_fwd" in basename or "fmha_batch_prefill" in basename)
-            else "fmha_bwd"
-        ),
+        "source": _rel(rw_src),
+        "cwd":    _rel(os.getcwd()),
+        "argv":   _extract_flags(new_argv, rw_src, rw_src, output_abs, output_abs),
+        "kind":   "api",
     }
     append_to_manifest(entry)
     return 0
@@ -392,10 +397,9 @@ def main():
     if is_blob:
         # Blobs: record manifest entry, write zero-byte stub (compiled on demand at runtime).
         entry = {
-            "source": _rel(source_abs),
-            "output": _rel(output_abs),
+            "source": source_abs,
             "cwd":    _rel(os.getcwd()),
-            "argv":   _relativize_argv(argv, source, source_abs, output, output_abs),
+            "argv":   _extract_flags(argv, source, source_abs, output, output_abs),
             "kind":   "blob",
         }
         append_to_manifest(entry)

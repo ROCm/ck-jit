@@ -339,7 +339,6 @@ def _run_qola_compile(env, qola_dir, qola_manifest, aiter_dir, tmp_dir, gpu_arch
     return 0
 
 
-
 # ---------------------------------------------------------------------------
 # Artifact installation
 # ---------------------------------------------------------------------------
@@ -404,9 +403,12 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
     aiter_dir = os.path.abspath(aiter_dir)
     jit_dir   = os.path.abspath(jit_artifact_dir)
 
+    blobs_dir    = os.path.join(jit_dir, "blobs")
     entries      = []
     include_dirs = set()
     blob_copied  = 0
+
+    os.makedirs(blobs_dir, exist_ok=True)
 
     with open(ndjson_path) as f:
         for line in f:
@@ -417,34 +419,25 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            entries.append(entry)
 
             for a in entry.get("argv", []):
                 if a.startswith("-I") and not os.path.isabs(a[2:]):
                     include_dirs.add(a[2:])
 
-            if entry.get("kind") != "blob":
-                continue
+            if entry.get("kind") == "blob":
+                src_abs  = entry["source"]
+                basename = os.path.basename(src_abs)
+                if not os.path.exists(src_abs):
+                    print(f"{_TAG} WARNING: blob source not found: {src_abs}", file=sys.stderr)
+                else:
+                    shutil.copy2(src_abs, os.path.join(blobs_dir, basename))
+                    blob_copied += 1
+                # Replace build-time absolute source with just the blob name;
+                # consumers derive the path as blobs/<name> relative to CK_JIT_ROOT.
+                entry = {k: v for k, v in entry.items() if k != "source"}
+                entry["name"] = basename
 
-            src_stored = entry["source"]
-            if os.path.isabs(src_stored):
-                src_abs = src_stored
-                src_rel = os.path.relpath(src_abs, aiter_dir)
-            else:
-                src_rel = src_stored
-                src_abs = os.path.join(aiter_dir, src_rel)
-            # If src is outside aiter_dir the relpath escapes with ".." and
-            # joining it back to jit_dir resolves to the original file.
-            # Fall back to a tmp_dir-relative path in that case.
-            if src_rel.startswith(".."):
-                src_rel = os.path.relpath(src_abs, tmp_dir)
-            dst = os.path.join(jit_dir, src_rel)
-            if not os.path.exists(src_abs):
-                print(f"{_TAG} WARNING: blob source not found: {src_abs}", file=sys.stderr)
-                continue
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src_abs, dst)
-            blob_copied += 1
+            entries.append(entry)
 
     inc_copied = 0
     for inc_rel in sorted(include_dirs):
@@ -461,8 +454,11 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
 
     manifest_out = os.path.join(jit_dir, "ck_jit_manifest.json")
     with open(manifest_out, "w") as f:
-        json.dump(entries, f, separators=(",", ":"))
-        f.write("\n")
+        f.write("[\n")
+        for i, entry in enumerate(entries):
+            f.write(json.dumps(entry, separators=(",", ":")))
+            f.write("\n" if i == len(entries) - 1 else ",\n")
+        f.write("]\n")
 
     print(f"{_TAG} Manifest: {len(entries)} entries → {manifest_out}", file=sys.stderr)
     print(f"{_TAG} Copied {blob_copied} blob sources, {inc_copied} include dirs to {jit_dir}",

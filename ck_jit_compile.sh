@@ -103,7 +103,7 @@ echo "[CK-JIT-BUILD] output : $OUTPUT" >&2
 # Direct mode: source + flags known — single compile+link call.
 # --------------------------------------------------------------------------
 if [[ -n "$BLOB_SOURCE" ]]; then
-  [[ "${BLOB_SOURCE:0:1}" != "/" ]] && BLOB_SOURCE="${ROOT_DIR}/${BLOB_SOURCE}"
+  [[ "${BLOB_SOURCE:0:1}" != "/" ]] && BLOB_SOURCE="${ROOT_DIR}/blobs/${BLOB_SOURCE}"
   log "Direct mode: $BLOB_SOURCE"
   # Run from ROOT_DIR so that all relative -I paths in BLOB_FLAGS resolve correctly.
   (cd "$ROOT_DIR" && atomic_link_so \
@@ -116,7 +116,8 @@ if [[ -n "$BLOB_SOURCE" ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# Manifest mode: look up blob, compile to cached .o, then link.
+# Manifest mode: look up blob by name, then compile+link in one step
+# (same as direct mode, using entry["name"] to construct blobs/<name>).
 # --------------------------------------------------------------------------
 if [[ -z "$MANIFEST" || ! -f "$MANIFEST" ]]; then
   echo "[CK-JIT-BUILD] ERROR: --blob requires a manifest; pass --manifest or set CK_JIT_MANIFEST" >&2
@@ -125,117 +126,37 @@ fi
 
 echo "[CK-JIT-BUILD] manifest : $MANIFEST" >&2
 
-BUILD_TMP="$(mktemp -d)"
-trap 'rm -rf "$BUILD_TMP"' EXIT
+LOOKUP_TMP="$(mktemp)"
+trap 'rm -f "$LOOKUP_TMP"' EXIT
 
-OBJ_DIR="${BUILD_TMP}/objects"
-mkdir -p "$OBJ_DIR"
-
-OBJS_FILE="${BUILD_TMP}/objs.txt"
-ARCH_FLAGS_FILE="${BUILD_TMP}/arch.txt"
-
-python3 - \
-  --manifest      "$MANIFEST" \
-  --blob          "$BLOB_NAME" \
-  --obj-dir       "$OBJ_DIR" \
-  --hipcc         "$HIPCC_BIN" \
-  --objs-out      "$OBJS_FILE" \
-  --arch-out      "$ARCH_FLAGS_FILE" \
-  --root          "$ROOT_DIR" \
-  <<'PYEOF'
-import argparse, json, os, subprocess, sys
-
-ap = argparse.ArgumentParser()
-ap.add_argument("--manifest")
-ap.add_argument("--blob")
-ap.add_argument("--obj-dir")
-ap.add_argument("--hipcc")
-ap.add_argument("--objs-out")
-ap.add_argument("--arch-out")
-ap.add_argument("--root", default="")
-args = ap.parse_args()
-
-def _abs(path):
-    if args.root and not os.path.isabs(path):
-        return os.path.join(args.root, path)
-    return path
-
-def norm(name):
-    for ext in (".cu", ".cpp"):
-        if name.endswith(ext):
-            return name[:-len(ext)]
-    return name
-
-with open(args.manifest) as f:
+python3 -c "
+import json, os, sys
+manifest, blob, root = sys.argv[1], sys.argv[2], sys.argv[3]
+def norm(n):
+    return n[:-4] if n.endswith('.cpp') else (n[:-3] if n.endswith('.cu') else n)
+with open(manifest) as f:
     entries = json.load(f)
-target = norm(args.blob)
+target = norm(blob)
 matches = [e for e in entries
-           if e.get("is_blob") and
-           norm(os.path.basename(e.get("source", ""))) == target]
+           if e.get('kind') == 'blob' and
+           norm(e.get('name', '')) == target]
 if not matches:
-    print(f"[CK-JIT-BUILD] ERROR: blob '{args.blob}' not in manifest.", file=sys.stderr)
+    print(f'[CK-JIT-BUILD] ERROR: blob {blob!r} not in manifest.', file=sys.stderr)
     sys.exit(1)
-entry = matches[0]
+e = matches[0]
+src = os.path.join(root, 'blobs', e['name']) if root else os.path.join('blobs', e['name'])
+print(src)
+print(' '.join(e.get('argv', [])))
+" "$MANIFEST" "$BLOB_NAME" "$ROOT_DIR" > "$LOOKUP_TMP" || exit 1
 
-arch_flags = [a for a in entry.get("argv", [])
-              if a.startswith("--offload-arch") or a.startswith("--amdgpu-target")]
-with open(args.arch_out, "w") as f:
-    f.write(" ".join(arch_flags) + "\n")
+BLOB_SOURCE="$(sed -n '1p' "$LOOKUP_TMP")"
+BLOB_FLAGS="$(sed -n '2p' "$LOOKUP_TMP")"
+log "Manifest mode resolved: $BLOB_SOURCE"
 
-src_base = os.path.basename(entry["source"])
-obj_out  = os.path.join(args.obj_dir, norm(src_base) + ".o")
-
-if os.path.exists(obj_out):
-    print(f"[CK-JIT-BUILD] Using cached object: {obj_out}", file=sys.stderr)
-else:
-    stored = list(entry["argv"])
-    src_rel = entry["source"]
-    result_argv = [args.hipcc]
-    has_output = False
-    drop_flags = {"-fvisibility=hidden", "-fvisibility-inlines-hidden"}
-    i = 0
-    while i < len(stored):
-        a = stored[i]
-        if a == "-o" and i + 1 < len(stored):
-            result_argv.extend(["-o", obj_out])
-            has_output = True
-            i += 2
-        elif a in drop_flags:
-            i += 1
-        elif a == src_rel:
-            result_argv.append(_abs(a))
-            i += 1
-        elif a.startswith("-I"):
-            result_argv.append("-I" + _abs(a[2:]))
-            i += 1
-        elif a.startswith("-isystem"):
-            result_argv.append("-isystem" + _abs(a[len("-isystem"):]))
-            i += 1
-        else:
-            result_argv.append(a)
-            i += 1
-    if not has_output:
-        result_argv.extend(["-o", obj_out])
-
-    cwd = _abs(entry.get("cwd", "")) or os.getcwd()
-    os.makedirs(cwd, exist_ok=True)
-    r = subprocess.run(result_argv, cwd=cwd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"[CK-JIT-BUILD] ERROR compiling {src_base}:\n{r.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-with open(args.objs_out, "w") as f:
-    f.write(obj_out + "\n")
-print(f"[CK-JIT-BUILD] Compiled {src_base}.", file=sys.stderr)
-PYEOF
-
-ARCH_FLAGS="$(cat "$ARCH_FLAGS_FILE")"
-mapfile -t ALL_OBJS < "$OBJS_FILE"
-
-atomic_link_so \
-  $ARCH_FLAGS \
-  "${ALL_OBJS[@]}" \
+# Run from ROOT_DIR so relative -I paths in flags resolve correctly.
+(cd "$ROOT_DIR" && atomic_link_so \
+  $BLOB_FLAGS \
+  "$BLOB_SOURCE" \
   $LINK_FLAGS \
-  -Wl,-soname,"$(basename "$OUTPUT")"
-
+  -Wl,-soname,"$(basename "$OUTPUT")")
 echo "[CK-JIT-BUILD] SUCCESS: ${OUTPUT}" >&2

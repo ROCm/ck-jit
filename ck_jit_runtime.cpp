@@ -304,8 +304,8 @@ static void* compile_and_load_blob(const std::string& blob_basename,
         const ck_jit::BlobEntry* entry = find_blob_entry(blob_basename.c_str());
         std::string cmd = "bash " + g_build_script;
         if (entry) {
-            cmd += " --blob-source '" + std::string(entry->source) + "'"
-                   " --blob-flags '"  + std::string(entry->flags)  + "'";
+            cmd += " --blob-source '" + std::string(entry->name) + "'"
+                   " --blob-flags '"  + std::string(entry->flags) + "'";
         } else {
             cmd += " --blob " + blob_basename;
         }
