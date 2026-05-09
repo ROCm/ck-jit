@@ -63,13 +63,13 @@ def _select_codegen_patch(ck_submodule):
     def _git_commit_date(ck_dir, ref):
         r = subprocess.run(
             ["git", "log", "-1", "--format=%ct", ref, "--"],
-            cwd=ck_dir, capture_output=True, text=True,
+            cwd=ck_dir, capture_output=True, text=True, check=False
         )
         return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
 
     ops_commit_r = subprocess.run(
         ["git", "log", "-1", "--format=%H", "--", _CODEGEN_OPS_PATH],
-        cwd=ck_submodule, capture_output=True, text=True,
+        cwd=ck_submodule, capture_output=True, text=True, check=False
     )
     if ops_commit_r.returncode == 0 and ops_commit_r.stdout.strip():
         ops_commit = ops_commit_r.stdout.strip()
@@ -86,7 +86,7 @@ def _select_codegen_patch(ck_submodule):
     # Fallback: string-probe fmha_bwd.py when git timestamps are unavailable.
     bwd_py = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "fmha_bwd.py")
     try:
-        with open(bwd_py) as f:
+        with open(bwd_py, encoding="utf-8") as f:
             has_launcher = "FMHA_BWD_API_INNER_DISPATCH_LAUNCHER" in f.read()
     except OSError:
         has_launcher = False
@@ -108,8 +108,8 @@ def ck_build_lock(ck_submodule):
     Prevents concurrent builds sharing the same aiter from racing on
     codegen patch apply/revert.  Blocks until the lock is acquired.
     """
-    lock_path = os.path.join(ck_submodule, ".ck_jit_build.lock")
-    with open(lock_path, "w") as lf:
+    lock_path = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "__init__.py")
+    with open(lock_path, "r", encoding="utf-8") as lf:
         print(f"{_TAG} Waiting for build lock ({lock_path})...", file=sys.stderr)
         fcntl.flock(lf, fcntl.LOCK_EX)
         print(f"{_TAG} build lock acquired.", file=sys.stderr)
@@ -145,7 +145,7 @@ def _apply_codegen_patch(codegen_dir, patch_path):
     # Dry-run first — no files are written, no .rej files created.
     dry = subprocess.run(
         base_cmd + ["--dry-run"],
-        cwd=codegen_dir, capture_output=True, text=True,
+        cwd=codegen_dir, capture_output=True, text=True, check=False
     )
     if dry.returncode != 0:
         if "already" in dry.stdout or "Reversed" in dry.stdout:
@@ -157,7 +157,7 @@ def _apply_codegen_patch(codegen_dir, patch_path):
         return False
 
     # Dry-run succeeded — apply for real.
-    r = subprocess.run(base_cmd, cwd=codegen_dir, capture_output=True, text=True)
+    r = subprocess.run(base_cmd, cwd=codegen_dir, capture_output=True, text=True, check=False)
     if r.returncode != 0:
         print(f"{_TAG} ERROR: codegen patch apply failed:\n{r.stdout}{r.stderr}",
               file=sys.stderr)
@@ -172,7 +172,7 @@ def _revert_codegen_patch(codegen_dir, patch_path):
         return
     r = subprocess.run(
         ["patch", "-p1", "--reverse", "--input", patch_path],
-        cwd=codegen_dir, capture_output=True, text=True,
+        cwd=codegen_dir, capture_output=True, text=True, check=False
     )
     if r.returncode != 0:
         if "already" in r.stdout or "Reversed" in r.stdout:
@@ -218,7 +218,7 @@ def _create_fake_rocm(real_rocm, tmp_dir, interceptor):
     os.makedirs(fake_bin, exist_ok=True)
 
     def _write_wrapper(dest):
-        with open(dest, "w") as f:
+        with open(dest, "w", encoding="utf-8") as f:
             f.write("#!/usr/bin/env bash\n")
             f.write(f'exec python3 "{interceptor}" "$@"\n')
         os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -260,7 +260,7 @@ def _create_fake_rocm(real_rocm, tmp_dir, interceptor):
 
 def _run_compile(env, compile_py, api, log_path):
     """Run compile.py --api <api>, stream output to log_path. Returns rc."""
-    with open(log_path, "w") as lf:
+    with open(log_path, "w", encoding="utf-8") as lf:
         if isinstance(compile_py, (str, os.PathLike)):
             compile_py = [compile_py]
         else:
@@ -270,6 +270,7 @@ def _run_compile(env, compile_py, api, log_path):
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
+            check=False
         )
     return r.returncode
 
@@ -294,7 +295,7 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
     def _dump(label, log):
         print(f"{_TAG} === {label} compile output ===", file=sys.stderr)
         try:
-            with open(log) as f:
+            with open(log, encoding="utf-8") as f:
                 sys.stderr.write(f.read())
         except OSError:
             pass
@@ -312,26 +313,27 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
     return rc
 
 
-def _run_qola_compile(env, qola_dir, qola_manifest, aiter_dir, tmp_dir, gpu_archs):
+def _run_qola_compile(env, qola_dir, qola_manifest, qola_output, aiter_dir, tmp_dir, gpu_archs):
     env["PYTHONPATH"] = os.pathsep.join([os.path.abspath(qola_dir), env.get("PYTHONPATH", "")])
     log = os.path.join(tmp_dir, "qola_build.log")
-    with open(log, "w") as lf:
+    with open(log, "w", encoding="utf-8") as lf:
         r = subprocess.run(
             [sys.executable, "-m", "qola.cli", "build",
             "--manifest", qola_manifest,
             "--aiter-root", aiter_dir,
-            "--output-dir", os.path.join(tmp_dir, "qola"),
+            "--output-dir", qola_output or os.path.join(tmp_dir, "qola"),
             "--arch", gpu_archs,
             ],
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
+            check=False
         )
     if r.returncode != 0:
         print(f"{_TAG} ERROR: qola compile failed (rc={r.returncode})", file=sys.stderr)
         print(f"{_TAG} === qola compile output ===", file=sys.stderr)
         try:
-            with open(log) as f:
+            with open(log, encoding="utf-8") as f:
                 sys.stderr.write(f.read())
         except OSError:
             pass
@@ -345,7 +347,7 @@ def _run_qola_compile(env, qola_dir, qola_manifest, aiter_dir, tmp_dir, gpu_arch
 
 def _count_ndjson(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
     except OSError:
         return None
@@ -355,7 +357,7 @@ def _resolve_so_from_state(tmp_dir, lib, aiter_dir):
     """Read out_so from quick-rebuild state file, resolve path prefixes."""
     state_path = os.path.join(tmp_dir, lib, "ck_jit_quick_rebuild.json")
     try:
-        with open(state_path) as f:
+        with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -410,7 +412,7 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
 
     os.makedirs(blobs_dir, exist_ok=True)
 
-    with open(ndjson_path) as f:
+    with open(ndjson_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -453,7 +455,7 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
         inc_copied += 1
 
     manifest_out = os.path.join(jit_dir, "ck_jit_manifest.json")
-    with open(manifest_out, "w") as f:
+    with open(manifest_out, "w", encoding="utf-8") as f:
         f.write("[\n")
         for i, entry in enumerate(entries):
             f.write(json.dumps(entry, separators=(",", ":")))
@@ -480,6 +482,7 @@ def cmd_full(args):
     if use_qola:
         qola_dir      = args.qola_dir
         qola_manifest = args.qola_manifest
+        qola_output   = args.qola_output
 
     interceptor  = os.path.join(_SCRIPT_DIR, "ck_build_interceptor.py")
     runtime_src  = os.path.join(_SCRIPT_DIR, "ck_jit_runtime.cpp")
@@ -564,7 +567,15 @@ def cmd_full(args):
 
         try:
             if use_qola:
-                rc = _run_qola_compile(env, qola_dir, qola_manifest, aiter_dir, tmp_dir, gpu_archs)
+                rc = _run_qola_compile(
+                    env,
+                    qola_dir,
+                    qola_manifest,
+                    qola_output,
+                    aiter_dir,
+                    tmp_dir,
+                    gpu_archs,
+                )
             else:
                 rc = _run_parallel_compile(env, compile_py, tmp_dir)
         finally:
@@ -584,12 +595,12 @@ def cmd_full(args):
         _install_artifacts(tmp_dir, aiter_dir, install_dir)
 
     print(f"{_TAG} JIT build complete.", file=sys.stderr)
-    print(f"", file=sys.stderr)
+    print("", file=sys.stderr)
     print(f"{_TAG} Runtime environment variables (optional overrides):", file=sys.stderr)
-    print(f"  CK_JIT_ROOT     — default: {{dir of libmha_fwd.so}}/ck_jit/", file=sys.stderr)
-    print(f"                    expected: ck_jit_compile.sh", file=sys.stderr)
-    print(f"  CK_JIT_VERBOSE  — set to 1 for progress messages", file=sys.stderr)
-    print(f"  Each CK kernel variant is compiled on first use.", file=sys.stderr)
+    print("  CK_JIT_ROOT     — default: {{dir of libmha_fwd.so}}/ck_jit/", file=sys.stderr)
+    print("                    expected: ck_jit_compile.sh", file=sys.stderr)
+    print("  CK_JIT_VERBOSE  — set to 1 for progress messages", file=sys.stderr)
+    print("  Each CK kernel variant is compiled on first use.", file=sys.stderr)
 
     if _tmp_owner:
         shutil.rmtree(_tmp_owner, ignore_errors=True)
@@ -660,6 +671,8 @@ def main():
                     help="Path to QoLA root (required with --with-qola).")
     jp.add_argument("--qola-manifest", default="",
                     help="Path to QoLA manifest .toml (default: qola_manifest.toml next to this script).")
+    jp.add_argument("--qola-output", default="",
+                    help="Override QoLA --output-dir (default: <tmp-dir>/qola).")
 
     # ---- quick ----
     qp = sub.add_parser("quick",
