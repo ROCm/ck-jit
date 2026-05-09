@@ -515,14 +515,11 @@ def cmd_full(args):
         _tmp_owner = tmp_dir
     else:
         tmp_dir = os.path.abspath(tmp_dir)
-        os.makedirs(tmp_dir, exist_ok=True)
+        if os.path.exists(tmp_dir):
+            print(f"{_TAG} Cleaning tmp dir: {tmp_dir}", file=sys.stderr)
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir)
     print(f"{_TAG} JIT tmp dir: {tmp_dir}", file=sys.stderr)
-
-    # Remove stale manifest.
-    for fname in ("manifest.json", "manifest.json.ndjson", "manifest.json.lock"):
-        p = os.path.join(tmp_dir, fname)
-        if os.path.exists(p):
-            os.remove(p)
 
     # Create fake ROCm.
     fake_rocm, fake_hipcc, fake_cxx = _create_fake_rocm(real_rocm, tmp_dir, interceptor)
