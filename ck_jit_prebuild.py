@@ -48,6 +48,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 _TAG = "[CK-PREBUILD]"
@@ -248,19 +249,33 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
             flags.append(a)
             i += 1
 
-    cmd = [hipcc, "-shared", "-fPIC"] + flags + [src_abs]
-    if rocm_lib:
-        cmd.append(f"-L{rocm_lib}")
-    cmd += ["-lamdhip64", "-Wl,--allow-shlib-undefined",
-            f"-Wl,-soname,{blob_name}.so", "-o", so_path]
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".so.tmp")
+        os.close(tmp_fd)
 
-    if verbose:
-        print(f"{_TAG} compile+link: {shlex.join(cmd)}", file=sys.stderr)
+        cmd = [hipcc, "-shared", "-fPIC"] + flags + [src_abs]
+        if rocm_lib:
+            cmd.append(f"-L{rocm_lib}")
+        cmd += ["-lamdhip64", "-Wl,--allow-shlib-undefined",
+                f"-Wl,-soname,{blob_name}.so", "-o", tmp_path]
 
-    r = subprocess.run(cmd, capture_output=not verbose, text=True, check=False)
-    if r.returncode != 0:
-        msg = r.stderr.strip() if not verbose else ""
-        return blob_name, False, f"compile+link failed:\n{msg}"
+        if verbose:
+            print(f"{_TAG} compile+link: {shlex.join(cmd)}", file=sys.stderr)
+
+        r = subprocess.run(cmd, capture_output=not verbose, text=True, check=False)
+        if r.returncode != 0:
+            msg = r.stderr.strip() if not verbose else ""
+            return blob_name, False, f"compile+link failed:\n{msg}"
+
+        os.replace(tmp_path, so_path)
+        tmp_path = None  # successfully renamed; nothing to clean up
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     return blob_name, True, "compiled"
 
