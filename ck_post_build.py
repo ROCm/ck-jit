@@ -289,7 +289,7 @@ def validate_manifest(entries, root="", verbose=False):
 def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
               runtime_src, hipcc,
               ck_include="", aiter_include="", rocm_include="",
-              root="", jobs=1, verbose=False):
+              root="", verbose=False):
     """
     Produce the real out_so (libmha_fwd.so or libmha_bwd.so).
 
@@ -309,7 +309,6 @@ def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
     aiter_include : aiter csrc/include (optional; same fallback)
     rocm_include  : ROCm system include dir (optional; same fallback)
     root          : AITER root dir; paths in the manifest are relative to this
-    jobs          : parallel compile workers
     verbose       : print full compile commands
     """
     lib_name = os.path.basename(out_so)

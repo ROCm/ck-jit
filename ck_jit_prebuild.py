@@ -44,6 +44,7 @@ import argparse
 import glob as _glob
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -99,13 +100,30 @@ def _norm_name(name):
     return os.path.basename(name).split(".")[0]
 
 
-def _build_index(entries):
-    """Return {norm_basename: entry} for all blob entries."""
+def _entry_archs(entry):
+    """Return the set of arch strings from --offload-arch flags in entry argv."""
+    archs = set()
+    argv = entry.get("argv", [])
+    for i, a in enumerate(argv):
+        if a == "--offload-arch" and i + 1 < len(argv):
+            archs.add(argv[i + 1])
+        elif a.startswith("--offload-arch="):
+            archs.add(a[len("--offload-arch="):])
+    return archs
+
+
+def _build_index(entries, arch=""):
+    """
+    Return {norm_basename: entry} for all blob entries.
+    If arch is non-empty, only include blobs whose --offload-arch flags contain it.
+    """
     index = {}
     for e in entries:
         if e.get("kind") != "blob":
             continue
-        key = _norm_name(e.get("name"))
+        if arch and arch not in _entry_archs(e):
+            continue
+        key = _norm_name(e.get("name", ""))
         if key:
             index[key] = e
     return index
@@ -159,14 +177,6 @@ def _abs_path(p, root):
     if root:
         return os.path.normpath(os.path.join(root, p))
     return p
-
-
-def _arch_flags(entry):
-    flags = []
-    for a in entry.get("argv", []):
-        if a.startswith("--offload-arch") or a.startswith("--amdgpu-target"):
-            flags.append(a)
-    return flags
 
 
 def _find_rocm_lib():
@@ -261,7 +271,8 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
 
 def cmd_list(args):
     entries = load_manifest(args.manifest)
-    index   = _build_index(entries)
+    arch    = args.arch or ""
+    index   = _build_index(entries, arch)
     names   = collect_blob_names(args.blob, args.blob_list, args.all,
                                  args.blobs, index)
     if not names:
@@ -271,12 +282,13 @@ def cmd_list(args):
 
     found, missing = resolve_blobs(names, index)
 
-    print(f"Found:   {len(found)}")
+    arch_tag = f" (arch={arch})" if arch else ""
+    print(f"Found{arch_tag}:   {len(found)}")
     print(f"Missing: {len(missing)}")
 
     for e in found:
-        arch = " ".join(_arch_flags(e))
-        print(f"  + {_norm_name(e["name"])}  [{arch}]")
+        archs = " ".join(_entry_archs(e))
+        print(f"  + {_norm_name(e['name'])}  [{archs}]")
     for name in missing:
         print(f"  - {name}  (not in manifest)")
 
@@ -285,7 +297,8 @@ def cmd_list(args):
 
 def cmd_build(args):
     entries  = load_manifest(args.manifest)
-    index    = _build_index(entries)
+    arch     = args.arch or ""
+    index    = _build_index(entries, arch)
     names    = collect_blob_names(args.blob, args.blob_list, args.all,
                                   args.blobs, index)
     if not names:
@@ -320,7 +333,8 @@ def cmd_build(args):
               file=sys.stderr)
         return 1
 
-    print(f"{_TAG} Building {len(found)} blob(s) → {cache_dir}  (jobs={jobs})",
+    arch_tag = f"  arch={arch}" if arch else ""
+    print(f"{_TAG} Building {len(found)} blob(s) → {cache_dir}  (jobs={jobs}{arch_tag})",
           file=sys.stderr)
 
     n_ok = n_cached = n_fail = 0
@@ -428,6 +442,9 @@ def main():
 
     # ---- list ----
     lp = sub.add_parser("list", help="Show manifest entries for requested blobs.")
+    lp.add_argument("--arch", default="",
+                    help="Filter blobs by GPU architecture (e.g. gfx942). "
+                         "Only blobs compiled for this arch are shown.")
     _add_blob_args(lp)
 
     # ---- build ----
@@ -451,6 +468,10 @@ def main():
     bp.add_argument("--jobs", type=int, default=_default_jobs,
                     help="Parallel compile workers "
                          "(default: $CK_JIT_JOBS, $MAX_JOBS, or nproc).")
+    bp.add_argument("--arch", default="",
+                    help="Filter blobs by GPU architecture (e.g. gfx942). "
+                         "Only blobs compiled for this arch are built. "
+                         "Use with --all to build all blobs for the current GPU.")
     bp.add_argument("--force", action="store_true",
                     help="Recompile even if the .so already exists in cache.")
     bp.add_argument("--verbose", action="store_true")
