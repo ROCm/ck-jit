@@ -36,7 +36,6 @@
 #   CK_JIT_CK_INCLUDE     CK headers root (for ck_jit_runtime.cpp compile)
 #   CK_JIT_AITER_INCLUDE  aiter csrc/include (for ck_jit_runtime.cpp compile)
 #   CK_JIT_ROCM_INCLUDE   ROCm system include dir
-#   CK_JIT_JOBS           Parallel compile jobs for post-build (default: nproc)
 #   CK_JIT_AITER_DIR      AITER root directory; paths in the manifest are stored
 #                         relative to this dir to keep entries short and portable.
 
@@ -164,43 +163,10 @@ def parse_compile_command(argv):
 # line).  Each interceptor process opens the file, grabs an exclusive lock,
 # appends one line, and releases the lock — O(1) I/O regardless of how many
 # entries are already present.
-#
-# At link-step time (_post_build_for_lib) we call load_manifest() which reads
-# all lines and returns a list, identical to the old JSON-array format.
 # ---------------------------------------------------------------------------
 
 # Path of the append-only NDJSON log written during the build.
 _NDJSON_PATH = MANIFEST_PATH + ".ndjson"
-
-
-def load_manifest(path=None):
-    """
-    Read the manifest.  Supports both the NDJSON build log and, for
-    backwards compatibility, the old JSON-array format.
-    Returns a list of entry dicts.
-    """
-    ndjson = path + ".ndjson" if path else _NDJSON_PATH
-    # Prefer the NDJSON log if it exists.
-    if os.path.exists(ndjson):
-        entries = []
-        with open(ndjson) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-        return entries
-    # Fall back to the old JSON-array format.
-    target = path or MANIFEST_PATH
-    if not os.path.exists(target):
-        return []
-    try:
-        with open(target) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
 
 
 def append_to_manifest(entry):
@@ -213,10 +179,10 @@ def append_to_manifest(entry):
     os.makedirs(manifest_dir, exist_ok=True)
     lock_path = os.path.join(manifest_dir, "ck_jit_manifest.lock")
     line = json.dumps(entry, separators=(",", ":")) + "\n"
-    with open(lock_path, "w") as lf:
+    with open(lock_path, "w", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
-            with open(_NDJSON_PATH, "a") as f:
+            with open(_NDJSON_PATH, "a", encoding="utf-8") as f:
                 f.write(line)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
@@ -242,6 +208,7 @@ def compile_stub(output_path, _compiler_args=None):
 # ---------------------------------------------------------------------------
 
 def _find_hipcc():
+    """Locate the real hipcc binary. First check ROCM_PATH, then PATH."""
     root = os.environ.get("ROCM_PATH", "")
     if root:
         c = os.path.join(root, "bin", "hipcc")
@@ -252,9 +219,13 @@ def _find_hipcc():
 
 
 def run_real_compiler(argv):
+    """
+    Invoke the real compiler with the given argv, returning its exit code.
+    Used for non-intercepted commands and for api source compilation after rewriting.
+    """
     compiler = REAL_COMPILER or _find_hipcc()
     cmd = [compiler] + argv[1:]
-    return subprocess.run(cmd).returncode
+    return subprocess.run(cmd, check=False).returncode
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +267,6 @@ def _post_build_for_lib(link_argv, out_so):
         aiter_include = os.environ.get("CK_JIT_AITER_INCLUDE", ""),
         rocm_include  = os.environ.get("CK_JIT_ROCM_INCLUDE",  ""),
         root          = ROOT,
-        jobs          = int(os.environ.get("CK_JIT_JOBS", os.cpu_count() or 1)),
         verbose       = os.environ.get("CK_JIT_VERBOSE", "0") == "1",
     )
 
@@ -354,7 +324,7 @@ def _handle_api_source(argv, source_abs, output_abs, basename):
         print(f"[CK-JIT] api compile: {' '.join(shlex.quote(a) for a in new_argv)}",
               file=sys.stderr)
 
-    rc = subprocess.run(new_argv).returncode
+    rc = subprocess.run(new_argv, check=False).returncode
     if rc != 0:
         print(f"[CK-JIT] ERROR: api compile failed for {basename} (rc={rc})", file=sys.stderr)
         return rc

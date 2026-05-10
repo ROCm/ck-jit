@@ -9,8 +9,11 @@
 #   build  Compile requested blobs into the cache directory in parallel.
 #   clean  Remove cached .so (and .o) files.
 #
-# Cache directory default (also used by the runtime):
-#  $XDG_CACHE_HOME/<name>  or  $HOME/.cache/<name>
+# Cache directory resolution order (also used by the runtime):
+#  1. --cache-dir argument
+#  2. $CK_JIT_CACHE_DIR environment variable
+#  3. $XDG_CACHE_HOME/<name>  or  $HOME/.cache/<name>  where <name> comes from
+#     ck_jit_config.json beside the manifest (default: "ck_jit")
 #
 # Blob inputs (any mix of --blob / --blob-list / --all / positional args):
 #   - bare basename:     fmha_fwd_d128_fp16_batch_..._gfx950.cpp
@@ -42,7 +45,6 @@ import glob as _glob
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -51,14 +53,46 @@ _TAG = "[CK-PREBUILD]"
 
 
 # ---------------------------------------------------------------------------
-# Manifest loading and blob lookup
+# Manifest and config loading
 # ---------------------------------------------------------------------------
 
 def load_manifest(path):
-    with open(path) as f:
+    """
+    Load the manifest JSON file at the given path.
+    Returns the list of entries, or [] if not found or invalid.
+    """
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return data if isinstance(data, list) else []
 
+
+def _load_jit_config(manifest_path):
+    """
+    Read ck_jit_config.json from the same directory as the manifest.
+    Returns the config dict, or {} if not found or unreadable.
+    """
+    config_path = os.path.join(os.path.dirname(os.path.abspath(manifest_path)),
+                               "ck_jit_config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _default_cache_dir(manifest_path):
+    """
+    Return $XDG_CACHE_HOME/<name> or $HOME/.cache/<name> using the name from
+    ck_jit_config.json beside the manifest.  Falls back to 'ck_jit' if absent.
+    """
+    name = _load_jit_config(manifest_path).get("name", "ck_jit")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, name)
+
+
+# ---------------------------------------------------------------------------
+# Blob lookup
+# ---------------------------------------------------------------------------
 
 def _norm_name(name):
     """Return the stem of a blob name: strip directory and everything from the first dot."""
@@ -71,8 +105,9 @@ def _build_index(entries):
     for e in entries:
         if e.get("kind") != "blob":
             continue
-        key = _norm_name(e["source"])
-        index[key] = e
+        key = _norm_name(e.get("name"))
+        if key:
+            index[key] = e
     return index
 
 
@@ -106,7 +141,7 @@ def collect_blob_names(args_blobs, args_blob_list, args_all, positional, index):
 
 
 def _read_blob_file(path):
-    f = sys.stdin if path == "-" else open(path)
+    f = sys.stdin if path == "-" else open(path, "r", encoding="utf-8")
     try:
         return [line.strip() for line in f if line.strip() and not line.startswith("#")]
     finally:
@@ -160,24 +195,27 @@ def _find_hipcc():
 def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
     """
     Compile one blob entry into <cache_dir>/<blob>.so (combined compile+link).
-    Returns (blob_name, so_path, ok, message).
+    Returns (blob_name, ok, message).
     """
-    blob_name = _norm_name(entry["source"])
+    blob_name = _norm_name(entry.get("name"))
     so_path   = os.path.join(cache_dir, blob_name + ".so")
 
     if not force and os.path.exists(so_path):
-        return blob_name, so_path, True, "cached"
+        return blob_name, True, "cached"
 
-    src_abs = _abs_path(entry["source"], root)
+    # Installed manifest uses "name" (basename); source is blobs/<name> under root.
+    blob_file = entry.get("name")
+    src_rel   = os.path.join("blobs", blob_file)
+    src_abs   = _abs_path(src_rel, root)
     if not os.path.exists(src_abs):
-        return blob_name, so_path, False, f"source not found: {src_abs}"
+        return blob_name, False, f"source not found: {src_abs}"
 
     os.makedirs(cache_dir, exist_ok=True)
 
     # Build flags from stored argv: skip compiler, source, -c, -o <out>,
     # -fvisibility=hidden/-fvisibility-inlines-hidden; absolutize -I/-isystem.
     _DROP_FLAGS = frozenset({"-fvisibility=hidden", "-fvisibility-inlines-hidden"})
-    src = entry["source"]
+    src = blob_file
     flags = []
     argv = entry.get("argv", [])
     i = 1  # skip argv[0] (compiler)
@@ -209,12 +247,12 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
     if verbose:
         print(f"{_TAG} compile+link: {shlex.join(cmd)}", file=sys.stderr)
 
-    r = subprocess.run(cmd, capture_output=not verbose, text=True)
+    r = subprocess.run(cmd, capture_output=not verbose, text=True, check=False)
     if r.returncode != 0:
         msg = r.stderr.strip() if not verbose else ""
-        return blob_name, so_path, False, f"compile+link failed:\n{msg}"
+        return blob_name, False, f"compile+link failed:\n{msg}"
 
-    return blob_name, so_path, True, "compiled"
+    return blob_name, True, "compiled"
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +276,7 @@ def cmd_list(args):
 
     for e in found:
         arch = " ".join(_arch_flags(e))
-        print(f"  + {_norm_name(e['source'])}  [{arch}]")
+        print(f"  + {_norm_name(e["name"])}  [{arch}]")
     for name in missing:
         print(f"  - {name}  (not in manifest)")
 
@@ -266,15 +304,15 @@ def cmd_build(args):
         print(f"{_TAG} Nothing to build.", file=sys.stderr)
         return 1
 
-    if not args.cache_dir:
-        print(f"{_TAG} ERROR: --cache-dir or $CK_JIT_CACHE_DIR is required.", file=sys.stderr)
-        return 1
+    cache_dir = args.cache_dir or _default_cache_dir(args.manifest)
 
     hipcc    = args.hipcc or _find_hipcc()
     rocm_lib = args.rocm_lib or _find_rocm_lib()
-    root     = args.root or os.environ.get("CK_JIT_ROOT", "")
+    root = args.root or os.environ.get(
+        "CK_JIT_ROOT", os.path.dirname(os.path.abspath(__file__))
+    )
     jobs     = args.jobs
-    cache_dir = os.path.abspath(args.cache_dir)
+    cache_dir = os.path.abspath(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
 
     if not hipcc:
@@ -296,7 +334,7 @@ def cmd_build(args):
             for e in found
         }
         for fut in as_completed(futures):
-            blob_name, so_path, ok, msg = fut.result()
+            blob_name, ok, msg = fut.result()
             if ok:
                 if msg == "cached":
                     n_cached += 1
@@ -319,12 +357,7 @@ def cmd_build(args):
 # ---------------------------------------------------------------------------
 
 def cmd_clean(args):
-    if not args.cache_dir:
-        print(f"{_TAG} ERROR: --cache-dir or $CK_JIT_CACHE_DIR is required.",
-              file=sys.stderr)
-        return 1
-
-    cache_dir = os.path.abspath(args.cache_dir)
+    cache_dir = os.path.abspath(args.cache_dir or _default_cache_dir(args.manifest))
 
     if args.all:
         # Wipe every .so (and its .o) in the cache dir.
@@ -401,10 +434,11 @@ def main():
     bp = sub.add_parser("build", help="Compile requested blobs into cache dir.")
     bp.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
                     help="Output directory for compiled .so files "
-                         "(required; or set $CK_JIT_CACHE_DIR).")
+                         "(default: $CK_JIT_CACHE_DIR, then $XDG_CACHE_HOME/<name> "
+                         "from ck_jit_config.json, then ~/.cache/<name>).")
     bp.add_argument("--root", default="",
                     help="AITER root dir for resolving relative manifest paths "
-                         "(default: $CK_JIT_ROOT).")
+                         "(default: $CK_JIT_ROOT, then the script dir).")
     bp.add_argument("--hipcc", default="",
                     help="hipcc binary (default: auto-detect from ROCM_PATH).")
     bp.add_argument("--rocm-lib", default="",
@@ -426,7 +460,7 @@ def main():
     cp = sub.add_parser("clean", help="Remove cached .so (and .o) files.")
     cp.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
                     help="Cache directory to clean "
-                         "(required; or set $CK_JIT_CACHE_DIR).")
+                         "(default: same resolution as build --cache-dir).")
     cp.add_argument("--verbose", action="store_true",
                     help="Print each removed file path.")
     _add_blob_args(cp)

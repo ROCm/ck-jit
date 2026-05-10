@@ -374,13 +374,14 @@ def _resolve_so_from_state(tmp_dir, lib, aiter_dir):
     return out_so
 
 
-def _install_artifacts(tmp_dir, aiter_dir, install_dir):
+def _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name):
     """
     Copy libmha_fwd.so / libmha_bwd.so to install_dir, then build the
     deployable ck_jit/ subdirectory:
       - ck_jit_compile.sh  (runtime blob compiler)
       - ck_jit_manifest.json  (compact JSON from NDJSON)
-      - blob .cpp sources (relative layout preserved)
+      - ck_jit_config.json  (default CK_JIT_NAME for cache dir construction)
+      - blob .cpp sources (flat blobs/ layout)
       - include dirs referenced by -I flags in the manifest
     """
     ndjson_path = os.path.join(tmp_dir, "manifest.json.ndjson")
@@ -462,7 +463,13 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir):
             f.write("\n" if i == len(entries) - 1 else ",\n")
         f.write("]\n")
 
+    config_out = os.path.join(jit_dir, "ck_jit_config.json")
+    with open(config_out, "w", encoding="utf-8") as f:
+        json.dump({"name": jit_name}, f)
+        f.write("\n")
+
     print(f"{_TAG} Manifest: {len(entries)} entries → {manifest_out}", file=sys.stderr)
+    print(f"{_TAG} Config: name={jit_name!r} → {config_out}", file=sys.stderr)
     print(f"{_TAG} Copied {blob_copied} blob sources, {inc_copied} include dirs to {jit_dir}",
           file=sys.stderr)
     print(f"{_TAG} Installed JIT libs to: {install_dir}", file=sys.stderr)
@@ -478,6 +485,7 @@ def cmd_full(args):
     ck_tile_bf16  = args.ck_tile_bf16
     install_dir   = args.install_dir
     tmp_dir       = args.tmp_dir
+    jit_name      = args.jit_name
     use_qola      = args.with_qola
     if use_qola:
         qola_dir      = args.qola_dir
@@ -552,7 +560,7 @@ def cmd_full(args):
         "CK_JIT_CK_INCLUDE":               ck_include_dir,
         "CK_JIT_AITER_INCLUDE":            aiter_include_dir,
         "CK_JIT_ROCM_INCLUDE":             os.path.join(real_rocm, "include"),
-        "CK_JIT_JOBS":                     str(multiprocessing.cpu_count()),
+        "CK_JIT_NAME":                     jit_name,
         "CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT": str(ck_tile_bf16),
         "GPU_ARCHS":                       gpu_archs,
     })
@@ -592,7 +600,7 @@ def cmd_full(args):
     print(f"{_TAG} Manifest has {n if n is not None else '?'} entries.", file=sys.stderr)
 
     if install_dir:
-        _install_artifacts(tmp_dir, aiter_dir, install_dir)
+        _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name)
 
     print(f"{_TAG} JIT build complete.", file=sys.stderr)
     print("", file=sys.stderr)
@@ -673,6 +681,9 @@ def main():
                     help="Path to QoLA manifest .toml (default: qola_manifest.toml next to this script).")
     jp.add_argument("--qola-output", default="",
                     help="Override QoLA --output-dir (default: <tmp-dir>/qola).")
+    jp.add_argument("--jit-name", default="ck_jit",
+                    help="Value used by to construct the default cache dir "
+                         "(default: ck_jit).")
 
     # ---- quick ----
     qp = sub.add_parser("quick",
@@ -691,6 +702,12 @@ def main():
         if args.with_qola and (not args.qola_dir or not args.qola_manifest):
             print(
                 f"{_TAG} ERROR: --with-qola requires --qola-dir and --qola-manifest.",
+                file=sys.stderr,
+            )
+            return 1
+        if not args.jit_name:
+            print(
+                f"{_TAG} ERROR: --jit-name cannot be empty.",
                 file=sys.stderr,
             )
             return 1
