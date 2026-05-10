@@ -20,22 +20,16 @@
 # can compile individual blobs on demand.
 #
 # Usage:
-#   CK_JIT_REAL_COMPILER=/opt/rocm/bin/hipcc \
+#   CK_JIT_HIPCC=/opt/rocm/bin/hipcc \
 #   CK_JIT_TMP_DIR=/tmp/ck_jit \
-#   CK_JIT_INTERCEPT_ALL=1 \
 #   ck_build_interceptor.py [hipcc args ...]
 #
 # Environment variables:
-#   CK_JIT_REAL_COMPILER  Path to the real hipcc (required)
+#   CK_JIT_HIPCC          Path to the real hipcc
+#   CK_JIT_CXX            Path to the real c++
 #   CK_JIT_TMP_DIR        Build-time scratch directory; must be absolute.
 #                         manifest.json and per-lib build dirs are placed here.
 #                         (default: /tmp/ck_jit)
-#   CK_JIT_INTERCEPT_ALL  If "1", intercept ALL source files (not just blobs).
-#   CK_JIT_RUNTIME_SRC    Path to ck_jit_runtime.cpp
-#                         (default: resolved relative to this script)
-#   CK_JIT_CK_INCLUDE     CK headers root (for ck_jit_runtime.cpp compile)
-#   CK_JIT_AITER_INCLUDE  aiter csrc/include (for ck_jit_runtime.cpp compile)
-#   CK_JIT_ROCM_INCLUDE   ROCm system include dir
 #   CK_JIT_AITER_DIR      AITER root directory; paths in the manifest are stored
 #                         relative to this dir to keep entries short and portable.
 
@@ -49,29 +43,18 @@ import sys
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
-REAL_COMPILER   = os.environ.get("CK_JIT_REAL_COMPILER", "")
+REAL_HIPCC      = os.environ.get("CK_JIT_HIPCC", "")
 JIT_TMP_DIR     = os.environ.get("CK_JIT_TMP_DIR", "/tmp/ck_jit")
-MANIFEST_PATH   = os.path.join(JIT_TMP_DIR, "manifest.json")
-INTERCEPT_ALL   = os.environ.get("CK_JIT_INTERCEPT_ALL", "0") == "1"
-ROOT            = os.environ.get("CK_JIT_AITER_DIR", "")
-
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Regex matching any variant of the mha shared libraries we intercept the link step for:
-#   libmha_{fwd|bwd}.so          (plain)
-#   <prefix>_libmha_{fwd|bwd}.so  (namespace prefix, e.g. te_libmha_fwd.so)
-#   libmha_{fwd|bwd}_<suffix>.so  (suffix variant)
-_TARGET_LIB_RE = re.compile(r'^(?:.+_)?libmha_(fwd|bwd)(?:_.+)?\.so$')
-
+AITER_DIR       = os.environ.get("CK_JIT_AITER_DIR", "")
 
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
 
 def _rel(path):
-    """Return path relative to ROOT if it starts with ROOT; unchanged otherwise."""
-    if ROOT and path.startswith(ROOT):
-        return os.path.relpath(path, ROOT)
+    """Return path relative to AITER_DIR if it starts with AITER_DIR; unchanged otherwise."""
+    if AITER_DIR and path.startswith(AITER_DIR):
+        return os.path.relpath(path, AITER_DIR)
     return path
 
 
@@ -87,7 +70,7 @@ def _extract_flags(argv, source, source_abs, output, output_abs):
     Return compile flags from argv[1:] with:
       - compiler binary (argv[0]) dropped — substituted at use time
       - source file, -o <output>, -c, and visibility flags removed
-      - -I / -isystem paths relativized to ROOT
+      - -I / -isystem paths relativized to AITER_DIR
     The result is stored as the 'argv' (flags-only) field in the manifest.
     """
     result = []
@@ -165,24 +148,20 @@ def parse_compile_command(argv):
 # entries are already present.
 # ---------------------------------------------------------------------------
 
-# Path of the append-only NDJSON log written during the build.
-_NDJSON_PATH = MANIFEST_PATH + ".ndjson"
-
-
 def append_to_manifest(entry):
     """
     Atomically append one entry to the NDJSON build log.
     Uses an exclusive flock so concurrent ninja jobs don't interleave lines.
     O(1) — does not read or rewrite existing content.
     """
-    manifest_dir = os.path.dirname(_NDJSON_PATH)
-    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_dir = JIT_TMP_DIR
     lock_path = os.path.join(manifest_dir, "ck_jit_manifest.lock")
     line = json.dumps(entry, separators=(",", ":")) + "\n"
     with open(lock_path, "w", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
-            with open(_NDJSON_PATH, "a", encoding="utf-8") as f:
+            ndjson_path = os.path.join(manifest_dir, "manifest.json.ndjson")
+            with open(ndjson_path, "a", encoding="utf-8") as f:
                 f.write(line)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
@@ -218,12 +197,22 @@ def _find_hipcc():
     return shutil.which("hipcc") or "hipcc"
 
 
+def _find_cxx():
+    import shutil
+    return shutil.which("c++") or shutil.which("g++") or "c++"
+
+
 def run_real_compiler(argv):
     """
     Invoke the real compiler with the given argv, returning its exit code.
-    Used for non-intercepted commands and for api source compilation after rewriting.
+    When invoked as CXX (CK_JIT_AS_CXX=1), uses CK_JIT_CXX so that
+    host-only C++ compilation goes to the real C++ compiler, not hipcc.
+    _post_build_for_lib always uses CK_JIT_HIPCC (hipcc) regardless.
     """
-    compiler = REAL_COMPILER or _find_hipcc()
+    if os.environ.get("CK_JIT_AS_CXX", "0") == "1":
+        compiler = os.environ.get("CK_JIT_CXX", "") or _find_cxx()
+    else:
+        compiler = REAL_HIPCC or _find_hipcc()
     cmd = [compiler] + argv[1:]
     return subprocess.run(cmd, check=False).returncode
 
@@ -238,35 +227,28 @@ def _handle_link_step(argv):
     If -o matches libmha_{fwd|bwd}.so (with optional prefix/suffix), run the full post-build.
     Otherwise forward to the real linker.
     """
+    # Regex matching any variant of the mha shared libraries we intercept the link step for:
+    #   libmha_{fwd|bwd}.so          (plain)
+    #   <prefix>_libmha_{fwd|bwd}.so  (namespace prefix, e.g. te_libmha_fwd.so)
+    #   libmha_{fwd|bwd}_<suffix>.so  (suffix variant)
+    _target_lib_re = re.compile(r'^(?:.+_)?libmha_(fwd|bwd)(?:_.+)?\.so$')
     out_so = _find_arg(argv, "-o")
-    if out_so and _TARGET_LIB_RE.match(os.path.basename(out_so)):
+    if out_so and _target_lib_re.match(os.path.basename(out_so)):
         return _post_build_for_lib(argv, out_so)
     return run_real_compiler(argv)
 
 
 def _post_build_for_lib(link_argv, out_so):
     """Delegate to ck_post_build.build_lib (lazy import, only called at link time)."""
-    sys.path.insert(0, _THIS_DIR)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import ck_post_build as pb
-
-    runtime_src = os.environ.get("CK_JIT_RUNTIME_SRC",
-                                 os.path.join(_THIS_DIR, "ck_jit_runtime.cpp"))
-    if not os.path.exists(runtime_src):
-        print(f"[CK-JIT] ERROR: ck_jit_runtime.cpp not found: {runtime_src}",
-              file=sys.stderr)
-        return 1
 
     return pb.build_lib(
         out_so        = out_so,
         link_argv     = link_argv,
-        manifest_path = MANIFEST_PATH,
         jit_tmp_dir   = JIT_TMP_DIR,
-        runtime_src   = runtime_src,
-        hipcc         = REAL_COMPILER or _find_hipcc(),
-        ck_include    = os.environ.get("CK_JIT_CK_INCLUDE",    ""),
-        aiter_include = os.environ.get("CK_JIT_AITER_INCLUDE", ""),
-        rocm_include  = os.environ.get("CK_JIT_ROCM_INCLUDE",  ""),
-        root          = ROOT,
+        hipcc         = REAL_HIPCC or _find_hipcc(),
+        aiter_dir     = AITER_DIR,
         verbose       = os.environ.get("CK_JIT_VERBOSE", "0") == "1",
     )
 
@@ -283,7 +265,7 @@ def _handle_api_source(argv, source_abs, output_abs, basename):
 
     Returns the compiler exit code.
     """
-    sys.path.insert(0, _THIS_DIR)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import ck_api_rewrite as ar
 
     api_kind = ar.detect_api_kind(basename)
@@ -309,7 +291,7 @@ def _handle_api_source(argv, source_abs, output_abs, basename):
 
     # Build a new argv: replace compiler and source path; everything else (including
     # -o) is copied verbatim — subprocess inherits CWD so relative paths are valid.
-    compiler = REAL_COMPILER or _find_hipcc()
+    compiler = REAL_HIPCC or _find_hipcc()
     src_rel  = _rel(source_abs)
     new_argv = [compiler] + [
         rw_src if (a in (source_abs, src_rel, source_abs.replace("\\", "/"))
@@ -359,7 +341,7 @@ def main():
     is_blob = "/blob/" in source_abs.replace("\\", "/")
 
     # Api files: any fmha_fwd_*_api.{cu,cpp} or fmha_bwd_*_api.{cu,cpp}.
-    is_api = INTERCEPT_ALL and _is_api_source(basename)
+    is_api = _is_api_source(basename)
 
     if is_api:
         return _handle_api_source(argv, source_abs, output_abs, basename)

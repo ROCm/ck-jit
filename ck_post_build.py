@@ -50,7 +50,6 @@ def load_manifest(path):
 # Compilation helpers
 # ---------------------------------------------------------------------------
 
-
 def link_so(hipcc, objs, out_path, arch_flags_list, rocm_lib_dir, verbose=False):
     """Link object files into a shared library."""
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -119,46 +118,44 @@ def generate_embedded_header(entries, embedded_h, is_fwd):
 # ---------------------------------------------------------------------------
 
 def _find_rocm(hipcc=""):
-    """Locate hipcc and ROCm lib dir.
+    """Locate hipcc and ROCm dir.
 
-    If hipcc is already known, derives rocm_lib_dir from its path.
+    If hipcc is already known, derives rocm dir from its path.
     Otherwise scans ROCM_HOME / ROCM_PATH / /opt/rocm, then PATH.
-    Returns (hipcc, rocm_lib_dir).
+    Returns (hipcc, rocm_dir).
     """
-    if hipcc:
-        candidate = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(hipcc))), "lib")
-        return hipcc, (candidate if os.path.isdir(candidate) else "")
-
-    rocm_lib_dir = ""
-    for rocm_root in (os.environ.get("ROCM_HOME", ""),
+    for rocm_root in (os.path.dirname(os.path.dirname(os.path.abspath(hipcc))) if hipcc else "",
+                      os.environ.get("ROCM_HOME", ""),
                       os.environ.get("ROCM_PATH", ""),
                       "/opt/rocm"):
         if not rocm_root:
             continue
+        if not os.path.isdir(os.path.join(rocm_root, "lib")) or not os.path.isdir(
+            os.path.join(rocm_root, "include")
+        ):
+            continue
         if not hipcc and os.access(os.path.join(rocm_root, "bin", "hipcc"), os.X_OK):
             hipcc = os.path.join(rocm_root, "bin", "hipcc")
-        if not rocm_lib_dir and os.path.isdir(os.path.join(rocm_root, "lib")):
-            rocm_lib_dir = os.path.join(rocm_root, "lib")
-        if hipcc and rocm_lib_dir:
-            break
+        break
     if not hipcc:
         hipcc = shutil.which("hipcc") or ""
-    return hipcc, rocm_lib_dir
+    return hipcc, rocm_root
 
 
-def _derive_includes(aiter_dir, ck_include, aiter_include, rocm_include, rocm_lib_dir):
-    """Fill in empty include paths from aiter_dir / rocm_lib_dir.
-
+def _derive_includes(aiter_dir, rocm_root):
+    """Fill in empty include paths from aiter_dir / rocm_dir.
     Returns (ck_include, aiter_include, rocm_include, ck_fmha_include).
     """
+    ck_include    = os.environ.get("CK_JIT_CK_INCLUDE",    "")
+    aiter_include = os.environ.get("CK_JIT_AITER_INCLUDE", "")
+    rocm_include  = os.environ.get("CK_JIT_ROCM_INCLUDE",  "")
     if aiter_dir:
         if not ck_include:
             ck_include = os.path.join(aiter_dir, "3rdparty", "composable_kernel", "include")
         if not aiter_include:
             aiter_include = os.path.join(aiter_dir, "csrc", "include")
-    if not rocm_include and rocm_lib_dir:
-        rocm_include = os.path.join(os.path.dirname(rocm_lib_dir), "include")
+    if not rocm_include and rocm_root:
+        rocm_include = os.path.join(rocm_root, "include")
     ck_fmha_include = (
         os.path.join(os.path.dirname(ck_include), "example", "ck_tile", "01_fmha")
         if ck_include else ""
@@ -202,14 +199,14 @@ def _build_runtime_cmd(hipcc, is_fwd, ck_include, ck_fmha_include,
 # Manifest validation: cross-check JIT hint kernel names against blob entries.
 # ---------------------------------------------------------------------------
 
-def _kernel_refs_from_source(path, root=""):
+def _kernel_refs_from_source(path, aiter_dir=""):
     """
     Scan a rewritten api source file for //jit_*kernel: hint comments and
     return the set of blob basenames they reference.
     For //jit_combine_kernel:, also adds the derived _lse_ variant.
     """
-    if not os.path.isabs(path) and root:
-        path = os.path.join(root, path)
+    if not os.path.isabs(path) and aiter_dir:
+        path = os.path.join(aiter_dir, path)
     refs = set()
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -232,7 +229,7 @@ def _kernel_refs_from_source(path, root=""):
     return refs
 
 
-def validate_manifest(entries, root="", verbose=False):
+def validate_manifest(entries, aiter_dir="", verbose=False):
     """
     Validate the manifest after a full build:
       - All kernel basenames referenced in //jit_*kernel: hints in api source
@@ -256,7 +253,7 @@ def validate_manifest(entries, root="", verbose=False):
     referenced = set()
     for e in entries:
         if e.get("kind") == "api":
-            referenced.update(_kernel_refs_from_source(e["source"], root))
+            referenced.update(_kernel_refs_from_source(e["source"], aiter_dir))
 
     missing = referenced - blob_names
     unused  = blob_names  - referenced
@@ -286,15 +283,16 @@ def validate_manifest(entries, root="", verbose=False):
 # link-step interception time, and optionally standalone).
 # ---------------------------------------------------------------------------
 
-def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
-              runtime_src, hipcc,
-              ck_include="", aiter_include="", rocm_include="",
-              root="", verbose=False):
+def build_lib(out_so, link_argv, jit_tmp_dir,
+              hipcc, aiter_dir="", verbose=False):
     """
     Produce the real out_so (libmha_fwd.so or libmha_bwd.so).
 
     Called once per link step from ck_build_interceptor._post_build_for_lib,
     after ninja has completed all compile steps (manifest is fully populated).
+
+    Include paths (CK_JIT_CK_INCLUDE, CK_JIT_AITER_INCLUDE, CK_JIT_ROCM_INCLUDE)
+    are read from environment or derived from AITER aiter_dir.
 
     Parameters
     ----------
@@ -303,19 +301,29 @@ def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
                     flags and locate real host .o files by size > 0)
     manifest_path : path to the manifest NDJSON written by the interceptor
     jit_tmp_dir   : scratch dir for rewritten sources and objects
-    runtime_src   : path to ck_jit_runtime.cpp
     hipcc         : real hipcc binary
-    ck_include    : CK headers root (optional; falls back to scanning api argv)
-    aiter_include : aiter csrc/include (optional; same fallback)
-    rocm_include  : ROCm system include dir (optional; same fallback)
-    root          : AITER root dir; paths in the manifest are relative to this
+    aiter_dir          : AITER aiter_dir dir; paths in the manifest are relative to this
     verbose       : print full compile commands
     """
+    script_dir  = os.path.abspath(os.path.dirname(__file__))
     lib_name = os.path.basename(out_so)
     is_fwd   = "libmha_fwd" in lib_name
     tag      = "[CK-POST]"
 
     print(f"{tag} Building {lib_name}...", file=sys.stderr)
+
+    # ---- File paths validation ----
+    runtime_src = os.environ.get("CK_JIT_RUNTIME_SRC",
+                                 os.path.join(script_dir, "ck_jit_runtime.cpp"))
+    if not os.path.exists(runtime_src):
+        print(f"{tag} ERROR: ck_jit_runtime.cpp not found: {runtime_src}",
+              file=sys.stderr)
+        return 1
+    manifest_path = os.path.join(jit_tmp_dir, "manifest.json")
+    if not os.path.exists(manifest_path + ".ndjson"):
+        print(f"{tag} ERROR: manifest NDJSON not found: {manifest_path}.ndjson",
+              file=sys.stderr)
+        return 1
 
     # ---- Load manifest ----
     entries = load_manifest(manifest_path)
@@ -335,9 +343,9 @@ def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
     print(f"{tag} Arch flags: {arch_fl}", file=sys.stderr)
 
     # ---- ROCm lib dir and include paths ----
-    _, rocm_lib_dir = _find_rocm(hipcc)
+    _, rocm_root = _find_rocm(hipcc)
     ck_include, aiter_include, rocm_include, ck_fmha_include = _derive_includes(
-        root, ck_include, aiter_include, rocm_include, rocm_lib_dir)
+        aiter_dir, rocm_root)
 
     # ---- Scratch dirs (per-lib to avoid ck_jit_runtime.o races) ----
     # Use canonical name for build_dir so ck_jit_build.py can find the state
@@ -375,7 +383,7 @@ def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
     # ---- Validate manifest: check JIT hint kernel names against blob entries ----
     # API .o files were compiled by ck_build_interceptor (via ck_api_rewrite) at
     # intercept time and are already real non-zero-byte objects in host_objs above.
-    validate_manifest(entries, root=root, verbose=verbose)
+    validate_manifest(entries, aiter_dir=aiter_dir, verbose=verbose)
 
     # ---- Compile ck_jit_runtime.cpp ----
     runtime_obj = os.path.join(build_dir, "objs", "ck_jit_runtime.o")
@@ -395,7 +403,7 @@ def build_lib(out_so, link_argv, manifest_path, jit_tmp_dir,
     # real objects compiled by ck_build_interceptor at intercept time).
     all_objs = [o for o in host_objs + [runtime_obj]
                 if os.path.exists(o)]
-    rc = link_so(hipcc, all_objs, out_so, arch_fl, rocm_lib_dir, verbose)
+    rc = link_so(hipcc, all_objs, out_so, arch_fl, os.path.join(rocm_root, "lib"), verbose)
     if rc != 0:
         return rc
 
@@ -471,17 +479,14 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
     if jit_name:
         os.environ["CK_JIT_NAME"] = jit_name
 
-    # ---- Locate hipcc, ROCm lib dir, and include paths ----
-    hipcc, rocm_lib_dir = _find_rocm()
+    # ---- Locate hipcc, ROCm dir, and include paths ----
+    hipcc, rocm_root = _find_rocm()
     if not hipcc:
         print(f"{tag} ERROR: hipcc not found.", file=sys.stderr)
         return 1, None
 
-    ck_include    = os.environ.get("CK_JIT_CK_INCLUDE",    "")
-    aiter_include = os.environ.get("CK_JIT_AITER_INCLUDE", "")
-    rocm_include  = os.environ.get("CK_JIT_ROCM_INCLUDE",  "")
     ck_include, aiter_include, rocm_include, ck_fmha_include = _derive_includes(
-        aiter_dir, ck_include, aiter_include, rocm_include, rocm_lib_dir)
+        aiter_dir, rocm_root)
 
     # ---- Runtime source and object paths ----
     runtime_src = os.environ.get("CK_JIT_RUNTIME_SRC",
@@ -523,9 +528,8 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
               file=sys.stderr)
         return r.returncode, None
 
-    rc = link_so(hipcc, all_objs, out_so, arch_fl, rocm_lib_dir, verbose)
+    rc = link_so(hipcc, all_objs, out_so, arch_fl, os.path.join(rocm_root, "lib"), verbose)
     if rc != 0:
         return rc, None
     print(f"{tag} SUCCESS: {out_so}", file=sys.stderr)
     return 0, out_so
-

@@ -217,16 +217,17 @@ def _create_fake_rocm(real_rocm, tmp_dir, interceptor):
     fake_bin  = os.path.join(fake_rocm, "bin")
     os.makedirs(fake_bin, exist_ok=True)
 
-    def _write_wrapper(dest):
+    def _write_wrapper(dest, extra_env=""):
         with open(dest, "w", encoding="utf-8") as f:
             f.write("#!/usr/bin/env bash\n")
-            f.write(f'exec python3 "{interceptor}" "$@"\n')
+            prefix = f"{extra_env} " if extra_env else ""
+            f.write(f'{prefix}exec python3 "{interceptor}" "$@"\n')
         os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     fake_hipcc = os.path.join(fake_bin, "hipcc")
     fake_cxx   = os.path.join(fake_bin, "cxx_interceptor")
     _write_wrapper(fake_hipcc)
-    _write_wrapper(fake_cxx)
+    _write_wrapper(fake_cxx, extra_env="CK_JIT_AS_CXX=1")
 
     # Symlink all other entries from the real ROCm home.
     real_bin = os.path.join(real_rocm, "bin")
@@ -547,16 +548,18 @@ def cmd_full(args):
     ck_include_dir   = os.path.join(aiter_dir, "3rdparty", "composable_kernel", "include")
     aiter_include_dir = os.path.join(aiter_dir, "csrc", "include")
 
+    # Capture real CXX before we override it.
+    real_cxx = os.environ.get("CXX") or "c++"
+
     env = os.environ.copy()
     env.update({
         "ROCM_PATH":                       fake_rocm,
         "ROCM_HOME":                       "",
         "CXX":                             fake_cxx,
-        "CK_JIT_REAL_COMPILER":            real_hipcc,
+        "CK_JIT_HIPCC":                    real_hipcc,
+        "CK_JIT_CXX":                      real_cxx,
         "CK_JIT_TMP_DIR":                  tmp_dir,
         "CK_JIT_AITER_DIR":                aiter_dir,
-        "CK_JIT_INTERCEPT_ALL":            "1",
-        "CK_JIT_RUNTIME_SRC":              runtime_src,
         "CK_JIT_CK_INCLUDE":               ck_include_dir,
         "CK_JIT_AITER_INCLUDE":            aiter_include_dir,
         "CK_JIT_ROCM_INCLUDE":             os.path.join(real_rocm, "include"),
