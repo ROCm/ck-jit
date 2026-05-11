@@ -217,17 +217,12 @@ def _create_fake_rocm(real_rocm, tmp_dir, interceptor):
     fake_bin  = os.path.join(fake_rocm, "bin")
     os.makedirs(fake_bin, exist_ok=True)
 
-    def _write_wrapper(dest, extra_env=""):
-        with open(dest, "w", encoding="utf-8") as f:
-            f.write("#!/usr/bin/env bash\n")
-            prefix = f"{extra_env} " if extra_env else ""
-            f.write(f'{prefix}exec python3 "{interceptor}" "$@"\n')
-        os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
     fake_hipcc = os.path.join(fake_bin, "hipcc")
     fake_cxx   = os.path.join(fake_bin, "cxx_interceptor")
-    _write_wrapper(fake_hipcc)
-    _write_wrapper(fake_cxx, extra_env="CK_JIT_AS_CXX=1")
+    for dest in (fake_hipcc, fake_cxx):
+        if os.path.lexists(dest):
+            os.unlink(dest)
+        os.symlink(interceptor, dest)
 
     # Symlink all other entries from the real ROCm home.
     real_bin = os.path.join(real_rocm, "bin")

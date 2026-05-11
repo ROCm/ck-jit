@@ -43,9 +43,9 @@ import sys
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
-REAL_HIPCC      = os.environ.get("CK_JIT_HIPCC", "")
-JIT_TMP_DIR     = os.environ.get("CK_JIT_TMP_DIR", "/tmp/ck_jit")
-AITER_DIR       = os.environ.get("CK_JIT_AITER_DIR", "")
+REAL_HIPCC  = os.environ.get("CK_JIT_HIPCC", "")
+JIT_TMP_DIR = os.environ.get("CK_JIT_TMP_DIR", "/tmp/ck_jit")
+AITER_DIR   = os.environ.get("CK_JIT_AITER_DIR", "")
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -205,11 +205,15 @@ def _find_cxx():
 def run_real_compiler(argv):
     """
     Invoke the real compiler with the given argv, returning its exit code.
-    When invoked as CXX (CK_JIT_AS_CXX=1), uses CK_JIT_CXX so that
-    host-only C++ compilation goes to the real C++ compiler, not hipcc.
+    When invoked as CXX, uses CK_JIT_CXX so that host-only C++ compilation
+    goes to the real C++ compiler, not hipcc.
     _post_build_for_lib always uses CK_JIT_HIPCC (hipcc) regardless.
     """
-    if os.environ.get("CK_JIT_AS_CXX", "0") == "1":
+    # Role detection: cmake invokes us as "hipcc" (via ROCM_PATH/bin/hipcc symlink)
+    # or as whatever path is set in CXX. Only the hipcc invocation is the GPU role.
+    hipcc_names = frozenset({"hipcc", "ck_build_interceptor.py"})
+
+    if os.path.basename(sys.argv[0]) not in hipcc_names:
         compiler = os.environ.get("CK_JIT_CXX", "") or _find_cxx()
     else:
         compiler = REAL_HIPCC or _find_hipcc()
