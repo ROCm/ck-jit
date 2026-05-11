@@ -261,7 +261,7 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
                 f"-Wl,-soname,{blob_name}.so", "-o", tmp_path]
 
         if verbose:
-            print(f"{_TAG} compile+link: {shlex.join(cmd)}", file=sys.stderr)
+            print(f"{_TAG} compile+link: {shlex.join(cmd)}")
 
         r = subprocess.run(cmd, capture_output=not verbose, text=True, check=False)
         if r.returncode != 0:
@@ -326,10 +326,10 @@ def cmd_build(args):
         print(f"{_TAG} WARNING: {len(missing)} blob(s) not in manifest:",
               file=sys.stderr)
         for m in missing:
-            print(f"  {m}", file=sys.stderr)
+            print(f"  {m}")
 
     if not found:
-        print(f"{_TAG} Nothing to build.", file=sys.stderr)
+        print(f"{_TAG} Nothing to build.")
         return 1
 
     cache_dir = args.cache_dir or _default_cache_dir(args.manifest)
@@ -349,8 +349,7 @@ def cmd_build(args):
         return 1
 
     arch_tag = f"  arch={arch}" if arch else ""
-    print(f"{_TAG} Building {len(found)} blob(s) → {cache_dir}  (jobs={jobs}{arch_tag})",
-          file=sys.stderr)
+    print(f"{_TAG} Building {len(found)} blob(s) → {cache_dir}  (jobs={jobs}{arch_tag})")
 
     n_ok = n_cached = n_fail = 0
 
@@ -368,17 +367,30 @@ def cmd_build(args):
                 if msg == "cached":
                     n_cached += 1
                     if args.verbose:
-                        print(f"  [cached] {blob_name}", file=sys.stderr)
+                        print(f"  [cached] {blob_name}")
                 else:
                     n_ok += 1
-                    print(f"  [ok]     {blob_name}", file=sys.stderr)
+                    print(f"  [ok]     {blob_name}")
             else:
                 n_fail += 1
-                print(f"  [FAIL]   {blob_name}: {msg}", file=sys.stderr)
+                print(f"  [FAIL]   {blob_name}: {msg}")
 
-    print(f"{_TAG} Done: {n_ok} compiled, {n_cached} cached, {n_fail} failed.",
-          file=sys.stderr)
+    print(f"{_TAG} Done: {n_ok} compiled, {n_cached} cached, {n_fail} failed.")
     return 1 if n_fail else 0
+
+
+# ---------------------------------------------------------------------------
+# cache subcommand
+# ---------------------------------------------------------------------------
+
+def cmd_cache(args):
+    cache_dir = os.path.abspath(args.cache_dir or _default_cache_dir(args.manifest))
+    sos = sorted(_glob.glob(os.path.join(cache_dir, "*.so")))
+    print(f"Cache: {cache_dir}  ({len(sos)} entries)")
+    for p in sos:
+        size = os.path.getsize(p)
+        print(f"  {os.path.basename(p)}  ({size:,} B)")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -393,13 +405,13 @@ def cmd_clean(args):
         targets = (_glob.glob(os.path.join(cache_dir, "*.so")) +
                    _glob.glob(os.path.join(cache_dir, "*.so.*")))
         if not targets:
-            print(f"{_TAG} Nothing to clean in {cache_dir}.", file=sys.stderr)
+            print(f"{_TAG} Nothing to clean in {cache_dir}.")
             return 0
         for p in targets:
             os.remove(p)
             if args.verbose:
-                print(f"{_TAG} Removed {p}", file=sys.stderr)
-        print(f"{_TAG} Cleaned {len(targets)} file(s) from {cache_dir}.", file=sys.stderr)
+                print(f"{_TAG} Removed {p}")
+        print(f"{_TAG} Cleaned {len(targets)} file(s) from {cache_dir}.")
         return 0
 
     # Clean specific blobs.
@@ -419,10 +431,10 @@ def cmd_clean(args):
             if os.path.exists(p):
                 os.remove(p)
                 if args.verbose:
-                    print(f"{_TAG} Removed {p}", file=sys.stderr)
+                    print(f"{_TAG} Removed {p}")
                 removed += 1
 
-    print(f"{_TAG} Removed {removed} file(s).", file=sys.stderr)
+    print(f"{_TAG} Removed {removed} file(s).")
     return 0
 
 
@@ -492,6 +504,12 @@ def main():
     bp.add_argument("--verbose", action="store_true")
     _add_blob_args(bp)
 
+    # ---- cache ----
+    cachep = sub.add_parser("cache", help="List compiled .so files in the cache directory.")
+    cachep.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
+                        help="Cache directory to inspect "
+                             "(default: same resolution as build --cache-dir).")
+
     # ---- clean ----
     cp = sub.add_parser("clean", help="Remove cached .so (and .o) files.")
     cp.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
@@ -507,6 +525,8 @@ def main():
         sys.exit(cmd_list(args))
     elif args.command == "build":
         sys.exit(cmd_build(args))
+    elif args.command == "cache":
+        sys.exit(cmd_cache(args))
     elif args.command == "clean":
         sys.exit(cmd_clean(args))
 

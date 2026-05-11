@@ -79,8 +79,7 @@ def _select_codegen_patch(ck_submodule):
         if ops_ts is not None and launcher_ts is not None:
             patch = _CODEGEN_PATCH_V2 if ops_ts >= launcher_ts else _CODEGEN_PATCH_V1
             patch_commit = "fdf4bb7fc" if patch == _CODEGEN_PATCH_V2 else "0cafa68b6"
-            print(f"{_TAG} codegen/ops commit {ops_commit[:9]}: using patch {patch_commit}",
-                  file=sys.stderr)
+            print(f"{_TAG} codegen/ops commit {ops_commit[:9]}: using patch {patch_commit}")
             return patch
 
     # Fallback: string-probe fmha_bwd.py when git timestamps are unavailable.
@@ -92,8 +91,7 @@ def _select_codegen_patch(ck_submodule):
         has_launcher = False
     patch = _CODEGEN_PATCH_V2 if has_launcher else _CODEGEN_PATCH_V1
     patch_commit = "fdf4bb7fc" if has_launcher else "0cafa68b6"
-    print(f"{_TAG} git unavailable; selected patch {patch_commit} by string probe",
-          file=sys.stderr)
+    print(f"{_TAG} git unavailable; selected patch {patch_commit} by string probe")
     return patch
 
 
@@ -110,14 +108,14 @@ def ck_build_lock(ck_submodule):
     """
     lock_path = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "__init__.py")
     with open(lock_path, "r", encoding="utf-8") as lf:
-        print(f"{_TAG} Waiting for build lock ({lock_path})...", file=sys.stderr)
+        print(f"{_TAG} Waiting for build lock ({lock_path})...")
         fcntl.flock(lf, fcntl.LOCK_EX)
-        print(f"{_TAG} build lock acquired.", file=sys.stderr)
+        print(f"{_TAG} build lock acquired.")
         try:
             yield
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
-            print(f"{_TAG} build lock released.", file=sys.stderr)
+            print(f"{_TAG} build lock released.")
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +147,7 @@ def _apply_codegen_patch(codegen_dir, patch_path):
     )
     if dry.returncode != 0:
         if "already" in dry.stdout or "Reversed" in dry.stdout:
-            print(f"{_TAG} Codegen patch already applied.", file=sys.stderr)
+            print(f"{_TAG} Codegen patch already applied.")
             return True
         print(f"{_TAG} ERROR: codegen patch cannot be applied cleanly "
               f"(dry-run failed, no files modified):\n{dry.stdout}{dry.stderr}",
@@ -162,7 +160,7 @@ def _apply_codegen_patch(codegen_dir, patch_path):
         print(f"{_TAG} ERROR: codegen patch apply failed:\n{r.stdout}{r.stderr}",
               file=sys.stderr)
         return False
-    print(f"{_TAG} Codegen patch applied.", file=sys.stderr)
+    print(f"{_TAG} Codegen patch applied.")
     return True
 
 
@@ -176,12 +174,12 @@ def _revert_codegen_patch(codegen_dir, patch_path):
     )
     if r.returncode != 0:
         if "already" in r.stdout or "Reversed" in r.stdout:
-            print(f"{_TAG} Codegen patch already reverted.", file=sys.stderr)
+            print(f"{_TAG} Codegen patch already reverted.")
             return
         print(f"{_TAG} WARNING: could not revert codegen patch:\n{r.stdout}{r.stderr}",
               file=sys.stderr)
         return
-    print(f"{_TAG} Codegen patch reverted.", file=sys.stderr)
+    print(f"{_TAG} Codegen patch reverted.")
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +275,7 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
     Print captured output to stderr.
     Returns 0 on success, 1 if either failed.
     """
-    print(f"{_TAG} Starting parallel fwd/bwd compilation...", file=sys.stderr)
+    print(f"{_TAG} Starting parallel fwd/bwd compilation...")
     log_fwd = os.path.join(tmp_dir, "compile_fwd.log")
     log_bwd = os.path.join(tmp_dir, "compile_bwd.log")
 
@@ -296,15 +294,14 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
         except OSError:
             pass
 
-    _dump("fwd", log_fwd)
-    _dump("bwd", log_bwd)
-
     rc = 0
     if rc_fwd != 0:
         print(f"{_TAG} ERROR: fwd compile failed (rc={rc_fwd})", file=sys.stderr)
+        _dump("fwd", log_fwd)
         rc = 1
     if rc_bwd != 0:
         print(f"{_TAG} ERROR: bwd compile failed (rc={rc_bwd})", file=sys.stderr)
+        _dump("bwd", log_bwd)
         rc = 1
     return rc
 
@@ -464,11 +461,10 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name):
         json.dump({"name": jit_name}, f)
         f.write("\n")
 
-    print(f"{_TAG} Manifest: {len(entries)} entries → {manifest_out}", file=sys.stderr)
-    print(f"{_TAG} Config: name={jit_name!r} → {config_out}", file=sys.stderr)
-    print(f"{_TAG} Copied {blob_copied} blob sources, {inc_copied} include dirs to {jit_dir}",
-          file=sys.stderr)
-    print(f"{_TAG} Installed JIT libs to: {install_dir}", file=sys.stderr)
+    print(f"{_TAG} Manifest: {len(entries)} entries → {manifest_out}")
+    print(f"{_TAG} Config: name={jit_name!r} → {config_out}")
+    print(f"{_TAG} Copied {blob_copied} blob sources, {inc_copied} include dirs to {jit_dir}")
+    print(f"{_TAG} Installed JIT libs to: {install_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -507,13 +503,13 @@ def cmd_full(args):
     except RuntimeError as e:
         print(f"{_TAG} ERROR: {e}", file=sys.stderr)
         return 1
-    print(f"{_TAG} Real ROCm path: {real_rocm}", file=sys.stderr)
+    print(f"{_TAG} Real ROCm path: {real_rocm}")
 
     real_hipcc = os.path.join(real_rocm, "bin", "hipcc")
     if not os.access(real_hipcc, os.X_OK):
         print(f"{_TAG} ERROR: Cannot find hipcc at {real_hipcc}.", file=sys.stderr)
         return 1
-    print(f"{_TAG} Real hipcc: {real_hipcc}", file=sys.stderr)
+    print(f"{_TAG} Real hipcc: {real_hipcc}")
 
     # Resolve tmp_dir.
     _tmp_owner = None
@@ -523,15 +519,15 @@ def cmd_full(args):
     else:
         tmp_dir = os.path.abspath(tmp_dir)
         if os.path.exists(tmp_dir):
-            print(f"{_TAG} Cleaning tmp dir: {tmp_dir}", file=sys.stderr)
+            print(f"{_TAG} Cleaning tmp dir: {tmp_dir}")
             shutil.rmtree(tmp_dir)
         os.makedirs(tmp_dir)
-    print(f"{_TAG} JIT tmp dir: {tmp_dir}", file=sys.stderr)
+    print(f"{_TAG} JIT tmp dir: {tmp_dir}")
 
     # Create fake ROCm.
     fake_rocm, fake_hipcc, fake_cxx = _create_fake_rocm(real_rocm, tmp_dir, interceptor)
-    print(f"{_TAG} Fake ROCm home : {fake_rocm}", file=sys.stderr)
-    print(f"{_TAG} Fake hipcc     : {fake_hipcc}", file=sys.stderr)
+    print(f"{_TAG} Fake ROCm home : {fake_rocm}")
+    print(f"{_TAG} Fake hipcc     : {fake_hipcc}")
 
     # Clear prior aiter JIT build.
     aiter_jit_build = os.path.join(aiter_dir, "aiter", "jit", "build")
@@ -594,19 +590,19 @@ def cmd_full(args):
 
     ndjson = os.path.join(tmp_dir, "manifest.json.ndjson")
     n = _count_ndjson(ndjson)
-    print(f"{_TAG} Intercepted build complete.", file=sys.stderr)
-    print(f"{_TAG} Manifest has {n if n is not None else '?'} entries.", file=sys.stderr)
+    print(f"{_TAG} Intercepted build complete.")
+    print(f"{_TAG} Manifest has {n if n is not None else '?'} entries.")
 
     if install_dir:
         _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name)
 
-    print(f"{_TAG} JIT build complete.", file=sys.stderr)
-    print("", file=sys.stderr)
-    print(f"{_TAG} Runtime environment variables (optional overrides):", file=sys.stderr)
-    print("  CK_JIT_ROOT     — default: {{dir of libmha_fwd.so}}/ck_jit/", file=sys.stderr)
-    print("                    expected: ck_jit_compile.sh", file=sys.stderr)
-    print("  CK_JIT_VERBOSE  — set to 1 for progress messages", file=sys.stderr)
-    print("  Each CK kernel variant is compiled on first use.", file=sys.stderr)
+    print(f"{_TAG} JIT build complete.")
+    print("")
+    print(f"{_TAG} Runtime environment variables (optional overrides):")
+    print("  CK_JIT_ROOT     — default: {{dir of libmha_fwd.so}}/ck_jit/")
+    print("                    expected: ck_jit_compile.sh")
+    print("  CK_JIT_VERBOSE  — set to 1 for progress messages")
+    print("  Each CK kernel variant is compiled on first use.")
 
     if _tmp_owner:
         shutil.rmtree(_tmp_owner, ignore_errors=True)
@@ -626,16 +622,17 @@ def cmd_quick(args):
     for lib in ("libmha_fwd", "libmha_bwd"):
         state_path = os.path.join(tmp_dir, lib, "ck_jit_quick_rebuild.json")
         if not os.path.exists(state_path):
-            print(f"[CK-QUICK] No state for {lib} ({state_path}), skipping.", file=sys.stderr)
+            print(f"[CK-QUICK] WARNING: no state for {lib} ({state_path}), skipping.",
+                  file=sys.stderr)
             continue
         r, out_so = ck_post_build.quick_rebuild_lib(
             state_path, verbose=args.verbose, aiter_dir=args.aiter_dir)
         if r != 0:
-            print(f"[CK-QUICK] FAILED: {lib}", file=sys.stderr)
+            print(f"[CK-QUICK] ERROR: {lib} failed.", file=sys.stderr)
         results.append((r, out_so))
 
     if any(r != 0 for r, _ in results):
-        print("[CK-QUICK] Build failed — nothing installed.", file=sys.stderr)
+        print("[CK-QUICK] ERROR: build failed — nothing installed.", file=sys.stderr)
         return 1
 
     if args.install_dir:
@@ -643,8 +640,7 @@ def cmd_quick(args):
         for _, out_so in results:
             if out_so:
                 shutil.copy2(out_so, args.install_dir)
-                print(f"[CK-QUICK] Installed {os.path.basename(out_so)} → {args.install_dir}",
-                      file=sys.stderr)
+                print(f"[CK-QUICK] Installed {os.path.basename(out_so)} → {args.install_dir}")
     return 0
 
 

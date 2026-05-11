@@ -500,7 +500,7 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
     if os.path.exists(manifest_base + ".ndjson"):
         entries = load_manifest(manifest_base)
         n_emb = generate_embedded_header(entries, embedded_h, is_fwd)
-        print(f"{tag} Embedded manifest ({n_emb} entries) → {embedded_h}", file=sys.stderr)
+        print(f"{tag} Embedded manifest ({n_emb} entries) → {embedded_h}")
     else:
         print(f"{tag} WARNING: manifest NDJSON not found; generated headers not refreshed.",
               file=sys.stderr)
@@ -519,9 +519,9 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
             print(f"  {o}", file=sys.stderr)
         return 1, None
 
-    print(f"{tag} Recompiling {os.path.basename(runtime_src)}...", file=sys.stderr)
+    print(f"{tag} Recompiling {os.path.basename(runtime_src)}...")
     if verbose:
-        print(f"{tag} cmd: {' '.join(shlex.quote(a) for a in runtime_cmd)}", file=sys.stderr)
+        print(f"{tag} cmd: {' '.join(shlex.quote(a) for a in runtime_cmd)}")
     r = subprocess.run(runtime_cmd, capture_output=not verbose, text=True, check=False)
     if r.returncode != 0:
         print(f"{tag} ERROR compiling {os.path.basename(runtime_src)}:\n{r.stderr}",
@@ -531,5 +531,5 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
     rc = link_so(hipcc, all_objs, out_so, arch_fl, os.path.join(rocm_root, "lib"), verbose)
     if rc != 0:
         return rc, None
-    print(f"{tag} SUCCESS: {out_so}", file=sys.stderr)
+    print(f"{tag} SUCCESS: {out_so}")
     return 0, out_so
