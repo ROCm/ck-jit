@@ -307,7 +307,6 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
 
 
 def _run_qola_compile(env, qola_dir, qola_manifest, qola_output, aiter_dir, tmp_dir, gpu_archs):
-    env["PYTHONPATH"] = os.pathsep.join([os.path.abspath(qola_dir), env.get("PYTHONPATH", "")])
     log = os.path.join(tmp_dir, "qola_build.log")
     with open(log, "w", encoding="utf-8") as lf:
         r = subprocess.run(
@@ -317,6 +316,7 @@ def _run_qola_compile(env, qola_dir, qola_manifest, qola_output, aiter_dir, tmp_
             "--output-dir", qola_output or os.path.join(tmp_dir, "qola"),
             "--arch", gpu_archs,
             ],
+            cwd=qola_dir,
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
