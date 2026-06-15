@@ -335,6 +335,59 @@ def _run_qola_compile(env, qola_dir, qola_manifest, qola_output, aiter_dir, tmp_
 
 
 # ---------------------------------------------------------------------------
+# Arch-family filtering for the installed manifest
+# ---------------------------------------------------------------------------
+
+def _filter_blob_argv_for_install(argv, name):
+    """
+    Return argv with --offload-arch flags filtered to only those matching the
+    blob's arch family (derived from the filename suffix).
+
+    CK's build system passes all --offload-arch targets to every blob compile.
+    For arch-specific blobs (fmha_fwd / fmha_bwd / fmha_fwd_splitkv) this
+    means the installed manifest would carry flags for GPUs that will never
+    dispatch to that blob.  Filtering here ensures the installed
+    ck_jit_manifest.json already has correct, single-family flags so every
+    consumer (ck_jit_prebuild.py, ck_jit_compile.sh) gets them right without
+    needing their own filtering logic.
+
+    For arch-agnostic blobs (fmha_batch_prefill, no _gfx suffix) all flags are
+    kept unchanged.
+
+    The primitive helpers (_arch_suffix_from_name, _family_matches) live in
+    ck_post_build to avoid duplication; they are imported lazily here so that
+    ck_jit_build remains importable even when ck_post_build is not on sys.path.
+    """
+    from ck_post_build import _arch_suffix_from_name, _family_matches
+    blob_suffix = _arch_suffix_from_name(name)
+    if not blob_suffix:
+        return argv  # arch-agnostic: keep all flags
+
+    filtered, kept_any = [], False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--offload-arch" and i + 1 < len(argv):
+            if _family_matches(blob_suffix, argv[i + 1]):
+                filtered.extend([a, argv[i + 1]])
+                kept_any = True
+            i += 2
+        elif a.startswith("--offload-arch="):
+            val = a[len("--offload-arch="):]
+            if _family_matches(blob_suffix, val):
+                filtered.append(a)
+                kept_any = True
+            i += 1
+        else:
+            filtered.append(a)
+            i += 1
+
+    # Safety: if no matching arch was found (single-arch build already correct),
+    # return the original argv unchanged.
+    return filtered if kept_any else argv
+
+
+# ---------------------------------------------------------------------------
 # Artifact installation
 # ---------------------------------------------------------------------------
 
@@ -432,6 +485,11 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name):
                 # consumers derive the path as blobs/<name> relative to CK_JIT_ROOT.
                 entry = {k: v for k, v in entry.items() if k != "source"}
                 entry["name"] = basename
+                # Filter --offload-arch flags to only those matching the blob's
+                # arch family so every consumer of ck_jit_manifest.json gets
+                # correct, single-family compile flags without further filtering.
+                entry["argv"] = _filter_blob_argv_for_install(
+                    entry.get("argv", []), basename)
 
             entries.append(entry)
 

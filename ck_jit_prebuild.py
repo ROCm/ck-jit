@@ -101,6 +101,64 @@ def _norm_name(name):
     return os.path.basename(name).split(".")[0]
 
 
+def _arch_suffix_from_name(name):
+    """
+    Extract the GPU arch family suffix from a blob filename.
+
+    CK codegen embeds the ArchTrait.name as the last underscore-separated
+    token of the stem for fmha_fwd / fmha_bwd / fmha_fwd_splitkv blobs.
+    The suffix begins with "gfx" (e.g. "gfx9", "gfx950").
+
+    fmha_batch_prefill blobs have NO arch suffix (arch-agnostic).  Returns "".
+    """
+    stem = os.path.splitext(os.path.basename(name))[0]
+    idx  = stem.rfind("_")
+    if idx >= 0:
+        suffix = stem[idx + 1:]
+        if suffix.startswith("gfx"):
+            return suffix
+    return ""
+
+
+def _family_matches(blob_suffix, concrete_arch):
+    """
+    Return True if concrete_arch belongs to the blob family identified by
+    blob_suffix.  Mirrors the ArchTrait.preprocessor_check overrides used
+    in the CK FMHA codegen (see ck_post_build._family_matches).
+    """
+    a = concrete_arch
+    if blob_suffix == "gfx9":
+        return a.startswith("gfx9") and not a.startswith("gfx950")
+    if blob_suffix == "gfx950":
+        return a.startswith("gfx950")
+    if blob_suffix == "gfx11":
+        return a.startswith("gfx11") and not a.startswith("gfx115")
+    if blob_suffix == "gfx115":
+        return a.startswith("gfx115")
+    if blob_suffix == "gfx12":
+        return a.startswith("gfx12") and not a.startswith("gfx125")
+    if blob_suffix == "gfx125":
+        return a.startswith("gfx125")
+    return True  # unknown suffix — conservative include
+
+
+def _filter_names_by_arch(names, arch):
+    """
+    When arch is non-empty, drop names whose filename encodes a different arch
+    family (using _arch_suffix_from_name + _family_matches).
+    Names with no arch suffix are kept (arch-agnostic blobs).
+    Returns the filtered list; discarded names are silently ignored.
+    """
+    if not arch:
+        return list(names)
+    kept = []
+    for n in names:
+        suffix = _arch_suffix_from_name(n)
+        if not suffix or _family_matches(suffix, arch):
+            kept.append(n)
+    return kept
+
+
 def _entry_archs(entry):
     """Return the set of arch strings from --offload-arch flags in entry argv."""
     archs = set()
@@ -295,14 +353,18 @@ def cmd_list(args):
               file=sys.stderr)
         return 1
 
+    # Pre-filter: drop names whose filename encodes a different arch family.
+    # Everything remaining that resolve_blobs can't find is truly missing.
+    names = _filter_names_by_arch(names, arch)
+
     found, missing = resolve_blobs(names, index)
 
     arch_tag = f" (arch={arch})" if arch else ""
     print(f"Found{arch_tag}:   {len(found)}")
-    print(f"Missing: {len(missing)}")
+    print(f"Missing:  {len(missing)}")
 
     for e in found:
-        archs = " ".join(_entry_archs(e))
+        archs = " ".join(sorted(_entry_archs(e)))
         print(f"  + {_norm_name(e['name'])}  [{archs}]")
     for name in missing:
         print(f"  - {name}  (not in manifest)")
@@ -321,12 +383,17 @@ def cmd_build(args):
               "or positional args.", file=sys.stderr)
         return 1
 
+    # Pre-filter: drop names whose filename encodes a different arch family.
+    # Everything remaining that resolve_blobs can't find is truly missing.
+    names = _filter_names_by_arch(names, arch)
+
     found, missing = resolve_blobs(names, index)
+
     if missing:
         print(f"{_TAG} WARNING: {len(missing)} blob(s) not in manifest:",
               file=sys.stderr)
         for m in missing:
-            print(f"  {m}")
+            print(f"  {m}", file=sys.stderr)
 
     if not found:
         print(f"{_TAG} Nothing to build.")
@@ -386,10 +453,31 @@ def cmd_build(args):
 def cmd_cache(args):
     cache_dir = os.path.abspath(args.cache_dir or _default_cache_dir(args.manifest))
     sos = sorted(_glob.glob(os.path.join(cache_dir, "*.so")))
-    print(f"Cache: {cache_dir}  ({len(sos)} entries)")
-    for p in sos:
-        size = os.path.getsize(p)
-        print(f"  {os.path.basename(p)}  ({size:,} B)")
+
+    fmt = getattr(args, "format", "human")
+    write_blob_list = getattr(args, "write_blob_list", None)
+
+    # Collect bare stem names (strip .so) for blob-list output.
+    stems = [os.path.basename(p)[:-3] for p in sos]  # remove ".so"
+
+    if fmt == "blob-list":
+        # Machine-readable: one stem per line, no header, suitable for --blob-list.
+        for stem in stems:
+            print(stem)
+    else:
+        # Human-readable default output.
+        print(f"Cache: {cache_dir}  ({len(sos)} entries)")
+        for p in sos:
+            size = os.path.getsize(p)
+            print(f"  {os.path.basename(p)}  ({size:,} B)")
+
+    if write_blob_list:
+        out_path = os.path.abspath(write_blob_list)
+        with open(out_path, "w", encoding="utf-8") as f:
+            for stem in stems:
+                f.write(stem + "\n")
+        print(f"{_TAG} Wrote {len(stems)} blob name(s) to {out_path}", file=sys.stderr)
+
     return 0
 
 
@@ -509,6 +597,15 @@ def main():
     cachep.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
                         help="Cache directory to inspect "
                              "(default: same resolution as build --cache-dir).")
+    cachep.add_argument("--format", choices=["human", "blob-list"], default="human",
+                        help="Output format: 'human' (default) prints a table with sizes; "
+                             "'blob-list' prints one bare blob stem per line, suitable for "
+                             "piping into 'build --blob-list -' or saving to a file.")
+    cachep.add_argument("--write-blob-list", metavar="FILE",
+                        help="Write blob stems to FILE in blob-list format "
+                             "(one name per line). May be combined with --format human "
+                             "to keep the human-readable output on stdout while also "
+                             "generating the file.")
 
     # ---- clean ----
     cp = sub.add_parser("clean", help="Remove cached .so (and .o) files.")
