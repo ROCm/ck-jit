@@ -44,8 +44,16 @@ def rewrite_api_file(src_path, dst_path, api_kind):
     Read src_path, write dst_path with each inner dispatch block rewritten:
       - Drop every `using <jit_alias> = ...;` typedef (skips expensive template
         instantiations — the main compile-time speedup).
-      - Replace `return fmha_fwd_<...>(s, a);` → `return ck_jit_fwd_call(...);`
-        etc., using blob names from //jit_kernel: hint comments.
+      - Replace dispatch calls/inits with JIT runtime calls using blob names
+        from //jit_kernel: hint comments.
+
+    Supports two bwd LAUNCHER formats:
+      Old (CK < 2c677e84): explicit `run = [...]; dq_acc_splits = ...; needs_zero_dq_acc = ...;`
+      New (CK >= 2c677e84): single `this->init<T0,T1,T2,Arch>(t);` call
+          → replaced inline: sets this->run, this->workspace_size, this->host_ws_size_,
+            this->needs_zero_dq_acc_, this->prepare_ws_func_, and this->traits_/batch_/etc.
+            directly.  Private field access is valid since these lines execute in the
+            constructor body (a member function scope) regardless of C++ nesting depth.
 
     Returns n_rewritten (number of dispatch calls rewritten, >= 0),
     or -1 on fatal error (prints message to stderr).
@@ -65,6 +73,8 @@ def rewrite_api_file(src_path, dst_path, api_kind):
     # 0=not seen, 1=awaiting lse return, 2=awaiting nlse return, -1=done
     lse_dispatch_state  = 0
     n_rewritten  = 0
+    # Per-block rewrite count used for validation (reset at each block entry).
+    n_rewritten_at_block_entry = 0
 
     jit_using_names = (
         "using trait_ ",
@@ -117,15 +127,17 @@ def rewrite_api_file(src_path, dst_path, api_kind):
                 if awaiting_open_brace:
                     # Continuation of a multi-line condition — wait for the closing `{`
                     if stripped.endswith("{"):
-                        in_block            = True
-                        brace_depth         = 1
-                        awaiting_open_brace = False
+                        in_block                   = True
+                        brace_depth                = 1
+                        awaiting_open_brace        = False
+                        n_rewritten_at_block_entry = n_rewritten
                     out_lines.append(line)
                     continue
                 if stripped.endswith("{") and ("if(" in stripped or "if (" in stripped):
                     if any_hint:
-                        in_block    = True
-                        brace_depth = 1
+                        in_block                   = True
+                        brace_depth                = 1
+                        n_rewritten_at_block_entry = n_rewritten
                 elif any_hint and ("if(" in stripped or "if (" in stripped) and not stripped.endswith("{"):
                     # Multi-line condition: `if(...)` spans more than one line
                     awaiting_open_brace = True
@@ -159,6 +171,14 @@ def rewrite_api_file(src_path, dst_path, api_kind):
                           f"but incomplete 'if (t.has_lse)' dispatch in {src_path}",
                           file=sys.stderr)
                     return -1
+                # Validate that at least one rewrite happened in this block.
+                if pending_kernel is not None and n_rewritten == n_rewritten_at_block_entry:
+                    print(
+                        f"[CK-API] ERROR: JIT hint block had no rewrite in {src_path}.\n"
+                        f"  Unrecognized dispatch pattern — CK version incompatibility?\n"
+                        f"  Hint was: //jit_kernel: {pending_kernel}",
+                        file=sys.stderr)
+                    return -1
                 in_block            = False
                 lse_dispatch_state  = 0
                 awaiting_open_brace = False
@@ -180,6 +200,10 @@ def rewrite_api_file(src_path, dst_path, api_kind):
             indent = line[: len(line) - len(line.lstrip())]
 
             if is_bwd:
+                # ----------------------------------------------------------
+                # Old LAUNCHER format (CK < 2c677e84):
+                #   run = [...]; dq_acc_splits = ...; needs_zero_dq_acc = ...
+                # ----------------------------------------------------------
                 bwd_prefix = ("r = " if stripped.startswith("r = fmha_bwd_<")
                               else "return " if stripped.startswith("return fmha_bwd_<")
                               else None)
@@ -201,6 +225,45 @@ def rewrite_api_file(src_path, dst_path, api_kind):
                 if stripped.startswith("needs_zero_dq_acc = fmha_bwd_dq_dk_dv_needs_zero_dq_acc_<"):
                     out_lines.append(
                         f'{indent}needs_zero_dq_acc = ck_jit_bwd_needs_zero_dq_acc("{pending_kernel}");')
+                    n_rewritten += 1
+                    continue
+
+                # ----------------------------------------------------------
+                # New LAUNCHER format (CK >= 2c677e84):
+                #   this->init<T0, T1, T2, Arch>(t)
+                #
+                # Expanded fully inline at each call site.  Private-field
+                # access is valid here because these lines run inside the
+                # constructor body (a member function scope); the C++ nesting
+                # depth of the surrounding if/else-if routing blocks is
+                # irrelevant for member access.
+                #
+                # CK commit 2c677e84: "[CK_TILE] Use Unified Workspace for FMHA BWD"
+                # ----------------------------------------------------------
+                if stripped.startswith("this->init<"):
+                    i2 = indent + "    "
+                    out_lines.extend([
+                        f'{indent}// CK commit 2c677e84: "[CK_TILE] Use Unified Workspace for FMHA BWD"',
+                        f'{indent}this->host_ws_size_      = ck_jit_bwd_dq_ws_host_size("{pending_kernel}", t.batch);',
+                        f'{indent}if (this->host_ws_size_ > 0) {{',
+                        f'{i2}const ck_tile::index_t ck_jit_tspq_ =',
+                        f'{i2}    t.is_group_mode ? t.seqlen_q : t.batch * t.seqlen_q;',
+                        f'{i2}this->workspace_size = this->host_ws_size_ +',
+                        f'{i2}    ck_jit_bwd_dq_ws_device_upper_bound(',
+                        f'{i2}        "{pending_kernel}", t.batch, t.hdim_q, t.nhead_q,',
+                        f'{i2}        ck_jit_tspq_, t.max_seqlen_k);',
+                        f'{i2}this->prepare_ws_func_ = reinterpret_cast<PrepareWorkspaceHostFunc>(',
+                        f'{i2}    ck_jit_bwd_get_prepare_ws_func("{pending_kernel}"));',
+                        f'{i2}this->traits_ = t;',
+                        f'{i2}this->batch_   = t.batch;  this->hdim_q_   = t.hdim_q;',
+                        f'{i2}this->nhead_q_ = t.nhead_q; this->seqlen_q_ = t.seqlen_q;',
+                        f'{i2}this->seqlen_k_ = t.seqlen_k;',
+                        f'{indent}}} else {{ this->workspace_size = 0; }}',
+                        f'{indent}this->needs_zero_dq_acc_ = ck_jit_bwd_needs_zero_dq_acc("{pending_kernel}");',
+                        f'{indent}this->run = [](fmha_bwd_args a, const ck_tile::stream_config& s_) {{',
+                        f'{i2}return ck_jit_bwd_call("{pending_dot}", "{pending_kernel}", "{pending_conv}", s_, a);',
+                        f'{indent}}};',
+                    ])
                     n_rewritten += 1
                     continue
 
@@ -255,9 +318,16 @@ def rewrite_api_file(src_path, dst_path, api_kind):
     # ------------------------------------------------------------------
     _sc = "const ck_tile::stream_config&"
     decl_map = {
-        "bwd":          (f"float ck_jit_bwd_call(const char*, const char*, const char*, {_sc}, fmha_bwd_args);\n"
-                         "int  ck_jit_bwd_dq_acc_splits(const char*, const fmha_bwd_traits&);\n"
-                         "bool ck_jit_bwd_needs_zero_dq_acc(const char*);\n"),
+        "bwd":          (
+            f"float ck_jit_bwd_call(const char*, const char*, const char*, {_sc}, fmha_bwd_args);\n"
+            "int   ck_jit_bwd_dq_acc_splits(const char*, const fmha_bwd_traits&);\n"
+            "bool  ck_jit_bwd_needs_zero_dq_acc(const char*);\n"
+            "// Workspace API — CK commit 2c677e84 \"[CK_TILE] Use Unified Workspace for FMHA BWD\":\n"
+            "size_t ck_jit_bwd_dq_ws_host_size(const char*, ck_tile::index_t);\n"
+            "size_t ck_jit_bwd_dq_ws_device_upper_bound(const char*, ck_tile::index_t,\n"
+            "    ck_tile::index_t, ck_tile::index_t, ck_tile::index_t, ck_tile::index_t);\n"
+            "void*  ck_jit_bwd_get_prepare_ws_func(const char*);\n"
+        ),
         "fwd_splitkv":  f"float ck_jit_fwd_splitkv_call(const char*, const char*, {_sc}, fmha_fwd_splitkv_args);\n",
         "batch_prefill":f"float ck_jit_batch_prefill_call(const char*, {_sc}, fmha_batch_prefill_args);\n",
         "fwd":          f"float ck_jit_fwd_call(const char*, {_sc}, fmha_fwd_args);\n",

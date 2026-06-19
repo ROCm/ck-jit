@@ -181,6 +181,19 @@ def _build_runtime_cmd(hipcc, is_fwd, ck_include, ck_fmha_include,
     cmd = [hipcc, "-std=c++20", "-fPIC", "-O2",
            f"-DCK_JIT_IS_FWD={1 if is_fwd else 0}",
            "-DENABLE_CK=1"]
+    # Detect workspace-based BWD API introduced in CK commit 2c677e84
+    # "[CK_TILE] Use Unified Workspace for FMHA BWD".
+    # When present, -DCK_JIT_BWD_WORKSPACE_V2=1 enables the new runtime helpers
+    # (ck_jit_bwd_dq_ws_host_size, ck_jit_bwd_dq_ws_device_upper_bound,
+    #  ck_jit_bwd_get_prepare_ws_func) in ck_jit_runtime.cpp.
+    _fmha_bwd_hpp = os.path.join(ck_fmha_include, "fmha_bwd.hpp") if ck_fmha_include else ""
+    if _fmha_bwd_hpp and os.path.isfile(_fmha_bwd_hpp):
+        try:
+            with open(_fmha_bwd_hpp, encoding="utf-8") as _fh:
+                if "PrepareWorkspaceHostFunc" in _fh.read():
+                    cmd.append("-DCK_JIT_BWD_WORKSPACE_V2=1")
+        except OSError:
+            pass
     if arch_flags:
         cmd.extend(arch_flags)
     for env_var in ("CK_JIT_ROOT", "CK_JIT_NAME"):

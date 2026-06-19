@@ -117,6 +117,17 @@ struct BwdDqBlobState : BlobState {
     std::once_flag  meta_init_flag;
     void*           fn_splits   = nullptr;  // fmha_bwd_dq_dk_dv_dq_acc_splits_<>
     void*           fn_zero_acc = nullptr;  // fmha_bwd_dq_dk_dv_needs_zero_dq_acc_<>
+
+#ifdef CK_JIT_BWD_WORKSPACE_V2
+    // Workspace-based API — CK commit 2c677e84
+    // "[CK_TILE] Use Unified Workspace for FMHA BWD"
+    // Enabled by -DCK_JIT_BWD_WORKSPACE_V2 in ck_post_build._build_runtime_cmd
+    // when fmha_bwd.hpp declares PrepareWorkspaceHostFunc.
+    std::once_flag  ws_meta_init_flag;
+    void*           fn_ws_host_size          = nullptr;  // dq_ws_host_size_<>
+    void*           fn_ws_device_upper_bound = nullptr;  // dq_ws_device_upper_bound_<>
+    void*           fn_prepare_ws_host       = nullptr;  // dq_prepare_ws_host_<>
+#endif
 };
 
 
@@ -629,6 +640,102 @@ static void resolve_bwd_dq_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state
                                                "_Z36fmha_bwd_dq_dk_dv_needs_zero_dq_acc_I");
     });
 }
+
+#ifdef CK_JIT_BWD_WORKSPACE_V2
+// ---------------------------------------------------------------------------
+// Workspace-based API helpers — CK commit 2c677e84
+// "[CK_TILE] Use Unified Workspace for FMHA BWD"
+//
+// Resolves three new symbols from the dq_dk_dv blob:
+//   fmha_bwd_dq_dk_dv_dq_ws_host_size_<T,Arch>(int batch)      → size_t
+//   fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_<T,Arch>(...)   → size_t
+//   fmha_bwd_dq_dk_dv_dq_prepare_ws_host_<T,Arch>(void*,...)   → size_t
+//
+// ELF mangled-name prefixes (Itanium ABI, template function length prefix):
+//   _Z34fmha_bwd_dq_dk_dv_dq_ws_host_size_I          (34 chars)
+//   _Z43fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_I  (43 chars)
+//   _Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I        (37 chars)
+// ---------------------------------------------------------------------------
+static void resolve_bwd_dq_ws_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state)
+{
+    std::string dq_blob_s(dq_dk_dv_blob);
+    // Ensure the blob is compiled and loaded first.
+    std::call_once(state.init_flag, [&]() {
+        state.fn = compile_and_load_blob(
+            dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", state);
+    });
+    std::call_once(state.ws_meta_init_flag, [&]() {
+        if (!state.handle) return;
+        std::string safe = dq_blob_s;
+        for (char& c : safe) if (c == '/' || c == '\\') c = '_';
+        for (const char* ext : {".cpp", ".cu"})
+            if (safe.size() > std::strlen(ext) &&
+                safe.compare(safe.size()-std::strlen(ext), std::strlen(ext), ext) == 0)
+            { safe.resize(safe.size()-std::strlen(ext)); break; }
+        std::string so_path = g_cache_dir + "/" + safe + ".so";
+        state.fn_ws_host_size = find_sym_by_prefix(
+            state.handle, so_path.c_str(),
+            "_Z34fmha_bwd_dq_dk_dv_dq_ws_host_size_I");
+        state.fn_ws_device_upper_bound = find_sym_by_prefix(
+            state.handle, so_path.c_str(),
+            "_Z43fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_I");
+        state.fn_prepare_ws_host = find_sym_by_prefix(
+            state.handle, so_path.c_str(),
+            "_Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I");
+    });
+}
+#endif // CK_JIT_BWD_WORKSPACE_V2
+
+#ifdef CK_JIT_BWD_WORKSPACE_V2
+__attribute__((visibility("hidden")))
+size_t ck_jit_bwd_dq_ws_host_size(const char* dq_dk_dv_blob,
+                                    ck_tile::index_t batch)
+{
+    BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    if (!state->fn_ws_host_size) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: dq_ws_host_size symbol not found in %s\n",
+                  dq_dk_dv_blob);
+        return 0;
+    }
+    using fn_t = size_t (*)(ck_tile::index_t);
+    return reinterpret_cast<fn_t>(state->fn_ws_host_size)(batch);
+}
+
+__attribute__((visibility("hidden")))
+size_t ck_jit_bwd_dq_ws_device_upper_bound(const char*      dq_dk_dv_blob,
+                                             ck_tile::index_t max_batch,
+                                             ck_tile::index_t hdim_q,
+                                             ck_tile::index_t nhead_q,
+                                             ck_tile::index_t total_seqlen_q_padded,
+                                             ck_tile::index_t max_seqlen_k)
+{
+    BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    if (!state->fn_ws_device_upper_bound) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: dq_ws_device_upper_bound symbol not found in %s\n",
+                  dq_dk_dv_blob);
+        return 0;
+    }
+    using fn_t = size_t (*)(ck_tile::index_t, ck_tile::index_t,
+                             ck_tile::index_t, ck_tile::index_t, ck_tile::index_t);
+    return reinterpret_cast<fn_t>(state->fn_ws_device_upper_bound)(
+        max_batch, hdim_q, nhead_q, total_seqlen_q_padded, max_seqlen_k);
+}
+
+__attribute__((visibility("hidden")))
+void* ck_jit_bwd_get_prepare_ws_func(const char* dq_dk_dv_blob)
+{
+    BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    if (!state->fn_prepare_ws_host) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: dq_prepare_ws_host symbol not found in %s\n",
+                  dq_dk_dv_blob);
+        return nullptr;
+    }
+    return state->fn_prepare_ws_host;
+}
+#endif // CK_JIT_BWD_WORKSPACE_V2
 
 __attribute__((visibility("hidden")))
 int ck_jit_bwd_dq_acc_splits(const char* dq_dk_dv_blob,
