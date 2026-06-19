@@ -55,12 +55,7 @@ def _extract_visibility_ldflags(tokens):
 
     ck_jit reconstructs the final shared-library link from scratch (see
     ``link_so``), keeping only the object files and ``--offload-arch`` flags from
-    the original command. Linker flags injected upstream are therefore dropped --
-    most importantly QoLA's ``-Wl,--version-script,qola_exports.lds``, which
-    forces ``aiter::`` symbols local. Without it those symbols stay global and
-    collide (via symbol interposition) with the pip ``aiter`` package's
-    same-named symbols, which carry a different ``mha_bwd_args`` ABI -- crashing
-    the backward pass on ``assert(args.nhead_q % args.nhead_k == 0)``. Carry the
+    the original command. Linker flags injected upstream are therefore dropped. Carry the
     visibility flags (version script, exclude-libs) through explicitly.
     """
     flags = []
