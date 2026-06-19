@@ -50,41 +50,39 @@ def load_manifest(path):
 # Compilation helpers
 # ---------------------------------------------------------------------------
 
-def _extract_visibility_ldflags(tokens):
-    """Pick out symbol-visibility linker flags from a captured link command.
+def _extract_ld_flags(link_argv):
+    """Carry over linker flags ck_jit's link reconstruction would otherwise drop.
 
-    ck_jit reconstructs the final shared-library link from scratch (see
-    ``link_so``), keeping only the object files and ``--offload-arch`` flags from
-    the original command. Linker flags injected upstream are therefore dropped. Carry the
-    visibility flags (version script, exclude-libs) through explicitly.
+    Currently symbol-visibility flags (version script, exclude-libs); kept generic
+    for future extension. Read directly from link_argv (passed on the command
+    line, not via a ninja response file).
     """
     flags = []
-    toks = list(tokens)
     i = 0
-    while i < len(toks):
-        tok = toks[i]
+    while i < len(link_argv):
+        tok = link_argv[i]
         if "--version-script" in tok or "--exclude-libs" in tok:
             flags.append(tok)
             # Two-token form, e.g. "-Wl,--version-script -Wl,<path>".
-            if tok.endswith("--version-script") and i + 1 < len(toks):
-                flags.append(toks[i + 1])
+            if tok.endswith("--version-script") and i + 1 < len(link_argv):
+                flags.append(link_argv[i + 1])
                 i += 1
         i += 1
     return flags
 
 
-def link_so(hipcc, objs, out_path, arch_flags_list, rocm_lib_dir, verbose=False,
-            extra_ld_flags=None):
-    """Link object files into a shared library."""
+def link_so(hipcc, objs, out_path, ld_flags, rocm_lib_dir, verbose=False):
+    """Link object files into a shared library.
+
+    ld_flags carries both the arch flags and any forwarded linker flags
+    (see _extract_ld_flags); both are spliced in as-is.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    cmd = [hipcc, "-shared", "-fPIC"] + arch_flags_list + list(objs)
+    cmd = [hipcc, "-shared", "-fPIC"] + list(ld_flags) + list(objs)
     if rocm_lib_dir:
         cmd += [f"-L{rocm_lib_dir}"]
     cmd += ["-lamdhip64", "-ldl", "-Wl,--allow-shlib-undefined",
-            f"-Wl,-soname,{os.path.basename(out_path)}"]
-    if extra_ld_flags:
-        cmd += list(extra_ld_flags)
-    cmd += ["-o", out_path]
+            f"-Wl,-soname,{os.path.basename(out_path)}", "-o", out_path]
     print(f"[CK-POST] link: {out_path}", file=sys.stderr)
     if verbose:
         print(f"[CK-POST] link cmd: {' '.join(shlex.quote(a) for a in cmd)}", file=sys.stderr)
@@ -402,13 +400,12 @@ def build_lib(out_so, link_argv, jit_tmp_dir,
         if a.endswith(".o") and os.path.exists(a) and os.path.getsize(a) > 0
     ]
 
-    # ---- Symbol-visibility linker flags (e.g. -Wl,--version-script). The link
-    # is rebuilt from scratch below, so these must be carried over explicitly or
-    # internal symbols (aiter::) leak into the global namespace. See
-    # _extract_visibility_ldflags.
-    ld_fl = _extract_visibility_ldflags(_iter_link_tokens(link_argv))
+    # ---- Linker flags (e.g. -Wl,--version-script). The link is rebuilt from
+    # scratch below, so these must be carried over explicitly or internal symbols
+    # (aiter::) leak into the global namespace. See _extract_ld_flags.
+    ld_fl = _extract_ld_flags(link_argv)
     if ld_fl:
-        print(f"{tag} Visibility ld flags: {ld_fl}", file=sys.stderr)
+        print(f"{tag} Extra ld flags: {ld_fl}", file=sys.stderr)
 
     # ---- Generate embedded manifest header ----
     embedded_h = os.path.join(build_dir, "ck_jit_manifest_embedded.h")
@@ -438,8 +435,7 @@ def build_lib(out_so, link_argv, jit_tmp_dir,
     # real objects compiled by ck_build_interceptor at intercept time).
     all_objs = [o for o in host_objs + [runtime_obj]
                 if os.path.exists(o)]
-    rc = link_so(hipcc, all_objs, out_so, arch_fl, os.path.join(rocm_root, "lib"), verbose,
-                 extra_ld_flags=ld_fl)
+    rc = link_so(hipcc, all_objs, out_so, arch_fl + ld_fl, os.path.join(rocm_root, "lib"), verbose)
     if rc != 0:
         return rc
 
@@ -566,8 +562,7 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
               file=sys.stderr)
         return r.returncode, None
 
-    rc = link_so(hipcc, all_objs, out_so, arch_fl, os.path.join(rocm_root, "lib"), verbose,
-                 extra_ld_flags=ld_fl)
+    rc = link_so(hipcc, all_objs, out_so, arch_fl + ld_fl, os.path.join(rocm_root, "lib"), verbose)
     if rc != 0:
         return rc, None
     print(f"{tag} SUCCESS: {out_so}")
