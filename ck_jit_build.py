@@ -355,10 +355,11 @@ def _filter_blob_argv_for_install(argv, name):
     kept unchanged.
 
     The primitive helpers (_arch_suffix_from_name, _family_matches) live in
-    ck_post_build to avoid duplication; they are imported lazily here so that
-    ck_jit_build remains importable even when ck_post_build is not on sys.path.
+    ck_jit_utils (shared between build-time and runtime modules); imported lazily
+    so that ck_jit_build remains importable even when ck_jit_utils is not on
+    sys.path.
     """
-    from ck_post_build import _arch_suffix_from_name, _family_matches
+    from ck_jit_utils import _arch_suffix_from_name, _family_matches
     blob_suffix = _arch_suffix_from_name(name)
     if not blob_suffix:
         return argv  # arch-agnostic: keep all flags
@@ -444,7 +445,7 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name):
     os.makedirs(jit_artifact_dir, exist_ok=True)
 
     # Copy runtime scripts.
-    for name in ("ck_jit_compile.sh", "ck_jit_prebuild.py"):
+    for name in ("ck_jit_compile.sh", "ck_jit_prebuild.py", "ck_jit_utils.py"):
         dst = os.path.join(jit_artifact_dir, name)
         shutil.copy2(os.path.join(_SCRIPT_DIR, name), dst)
         os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

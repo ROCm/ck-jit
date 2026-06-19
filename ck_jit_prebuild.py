@@ -51,6 +51,17 @@ import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# Ensure ck_jit_utils (and other sibling modules) are importable regardless of
+# the working directory or how this script is invoked (direct execution, exec,
+# subprocess, etc.).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ck_jit_utils import (  # noqa: E402
+    _arch_suffix_from_name,
+    _family_matches,
+    _filter_names_by_arch,
+    find_rocm,
+)
+
 _TAG = "[CK-PREBUILD]"
 
 
@@ -100,63 +111,6 @@ def _norm_name(name):
     """Return the stem of a blob name: strip directory and everything from the first dot."""
     return os.path.basename(name).split(".")[0]
 
-
-def _arch_suffix_from_name(name):
-    """
-    Extract the GPU arch family suffix from a blob filename.
-
-    CK codegen embeds the ArchTrait.name as the last underscore-separated
-    token of the stem for fmha_fwd / fmha_bwd / fmha_fwd_splitkv blobs.
-    The suffix begins with "gfx" (e.g. "gfx9", "gfx950").
-
-    fmha_batch_prefill blobs have NO arch suffix (arch-agnostic).  Returns "".
-    """
-    stem = os.path.splitext(os.path.basename(name))[0]
-    idx  = stem.rfind("_")
-    if idx >= 0:
-        suffix = stem[idx + 1:]
-        if suffix.startswith("gfx"):
-            return suffix
-    return ""
-
-
-def _family_matches(blob_suffix, concrete_arch):
-    """
-    Return True if concrete_arch belongs to the blob family identified by
-    blob_suffix.  Mirrors the ArchTrait.preprocessor_check overrides used
-    in the CK FMHA codegen (see ck_post_build._family_matches).
-    """
-    a = concrete_arch
-    if blob_suffix == "gfx9":
-        return a.startswith("gfx9") and not a.startswith("gfx950")
-    if blob_suffix == "gfx950":
-        return a.startswith("gfx950")
-    if blob_suffix == "gfx11":
-        return a.startswith("gfx11") and not a.startswith("gfx115")
-    if blob_suffix == "gfx115":
-        return a.startswith("gfx115")
-    if blob_suffix == "gfx12":
-        return a.startswith("gfx12") and not a.startswith("gfx125")
-    if blob_suffix == "gfx125":
-        return a.startswith("gfx125")
-    return True  # unknown suffix — conservative include
-
-
-def _filter_names_by_arch(names, arch):
-    """
-    When arch is non-empty, drop names whose filename encodes a different arch
-    family (using _arch_suffix_from_name + _family_matches).
-    Names with no arch suffix are kept (arch-agnostic blobs).
-    Returns the filtered list; discarded names are silently ignored.
-    """
-    if not arch:
-        return list(names)
-    kept = []
-    for n in names:
-        suffix = _arch_suffix_from_name(n)
-        if not suffix or _family_matches(suffix, arch):
-            kept.append(n)
-    return kept
 
 
 def _entry_archs(entry):
@@ -236,29 +190,6 @@ def _abs_path(p, root):
     if root:
         return os.path.normpath(os.path.join(root, p))
     return p
-
-
-def _find_rocm_lib():
-    for candidate in (
-        os.environ.get("ROCM_PATH", ""),
-        os.environ.get("ROCM_HOME", ""),
-        "/opt/rocm",
-    ):
-        if candidate and os.path.isdir(os.path.join(candidate, "lib")):
-            return os.path.join(candidate, "lib")
-    return ""
-
-
-def _find_hipcc():
-    for candidate in (
-        os.path.join(os.environ.get("ROCM_PATH", ""), "bin", "hipcc"),
-        os.path.join(os.environ.get("ROCM_HOME", ""), "bin", "hipcc"),
-        "/opt/rocm/bin/hipcc",
-    ):
-        if candidate and os.access(candidate, os.X_OK):
-            return candidate
-    import shutil
-    return shutil.which("hipcc") or ""
 
 
 def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
@@ -401,8 +332,9 @@ def cmd_build(args):
 
     cache_dir = args.cache_dir or _default_cache_dir(args.manifest)
 
-    hipcc    = args.hipcc or _find_hipcc()
-    rocm_lib = args.rocm_lib or _find_rocm_lib()
+    _found_hipcc, _rocm_root = find_rocm()
+    hipcc    = args.hipcc or _found_hipcc
+    rocm_lib = args.rocm_lib or (os.path.join(_rocm_root, "lib") if _rocm_root else "")
     root = args.root or os.environ.get(
         "CK_JIT_ROOT", os.path.dirname(os.path.abspath(__file__))
     )
