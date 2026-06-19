@@ -331,6 +331,13 @@ def _handle_api_source(argv, source_abs, output_abs, basename):
 
 def main():
     argv = sys.argv[:]
+
+    # Version/info queries (e.g. -v, --version) from tools like AITER's ABI
+    # checker must go straight to the real compiler — don't route through
+    # _handle_link_step which may fail when there's no -o argument.
+    if len(argv) == 2 and argv[1] in ("-v", "-V", "--version", "--help"):
+        return run_real_compiler(argv)
+
     source, output = parse_compile_command(argv)
 
     if source is None or output is None:
