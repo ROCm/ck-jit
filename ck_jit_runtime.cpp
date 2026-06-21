@@ -107,6 +107,7 @@ struct BlobState {
     std::once_flag  init_flag;
     void*           fn     = nullptr;  // function pointer after init
     void*           handle = nullptr;  // dlopen handle
+    std::string     so_path;           // actual cache path (includes source_hash suffix)
 };
 
 // Extended state for dq_dk_dv blobs: carries the two host-side metadata
@@ -295,7 +296,15 @@ static void* compile_and_load_blob(const std::string& blob_basename,
                             std::strlen(ext), ext) == 0)
         { so_stem.resize(so_stem.size() - std::strlen(ext)); break; }
     }
-    std::string so_path = g_cache_dir + "/" + so_stem + ".so";
+
+    const ck_jit::BlobEntry* entry = find_blob_entry(blob_basename.c_str());
+
+    // embed source_hash in the cache filename so each CK version gets a unique path.
+    // Fall back to plain stem.so only for blobs absent from the manifest
+    // (compiled on demand via ck_jit_compile.sh --blob without interception).
+    std::string so_path = entry
+        ? g_cache_dir + "/" + so_stem + ".so." + entry->source_hash
+        : g_cache_dir + "/" + so_stem + ".so";
 
     struct stat st{};
     bool cached = (::stat(so_path.c_str(), &st) == 0);
@@ -312,7 +321,6 @@ static void* compile_and_load_blob(const std::string& blob_basename,
         ::fprintf(stderr,
             "[CK-JIT] JIT-compiling blob: %s\n", blob_basename.c_str());
 
-        const ck_jit::BlobEntry* entry = find_blob_entry(blob_basename.c_str());
         std::string cmd = "bash " + g_build_script;
         if (entry) {
             cmd += " --blob-source '" + std::string(entry->name) + "'"
@@ -344,7 +352,8 @@ static void* compile_and_load_blob(const std::string& blob_basename,
             so_path.c_str(), ::dlerror());
         return nullptr;
     }
-    state.handle = handle;
+    state.handle  = handle;
+    state.so_path = so_path;
 
     // Scan .dynsym for the blob function and resolve it via dlsym.
     // Blobs are compiled without -fvisibility=hidden so the symbol is exported.
@@ -625,18 +634,11 @@ static void resolve_bwd_dq_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state
             dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", state);
     });
     std::call_once(state.meta_init_flag, [&]() {
-        if (!state.handle) return;
-        // Reconstruct the so_path the same way compile_and_load_blob does.
-        std::string safe = dq_blob_s;
-        for (char& c : safe) if (c == '/' || c == '\\') c = '_';
-        for (const char* ext : {".cpp", ".cu"})
-            if (safe.size() > std::strlen(ext) &&
-                safe.compare(safe.size()-std::strlen(ext), std::strlen(ext), ext) == 0)
-            { safe.resize(safe.size()-std::strlen(ext)); break; }
-        std::string so_path = g_cache_dir + "/" + safe + ".so";
-        state.fn_splits   = find_sym_by_prefix(state.handle, so_path.c_str(),
+        if (!state.handle || state.so_path.empty()) return;
+        // Reuse so_path stored by compile_and_load_blob (includes source_hash suffix).
+        state.fn_splits   = find_sym_by_prefix(state.handle, state.so_path.c_str(),
                                                "_Z32fmha_bwd_dq_dk_dv_dq_acc_splits_I");
-        state.fn_zero_acc = find_sym_by_prefix(state.handle, so_path.c_str(),
+        state.fn_zero_acc = find_sym_by_prefix(state.handle, state.so_path.c_str(),
                                                "_Z36fmha_bwd_dq_dk_dv_needs_zero_dq_acc_I");
     });
 }
@@ -665,22 +667,16 @@ static void resolve_bwd_dq_ws_meta(const char* dq_dk_dv_blob, BwdDqBlobState& st
             dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", state);
     });
     std::call_once(state.ws_meta_init_flag, [&]() {
-        if (!state.handle) return;
-        std::string safe = dq_blob_s;
-        for (char& c : safe) if (c == '/' || c == '\\') c = '_';
-        for (const char* ext : {".cpp", ".cu"})
-            if (safe.size() > std::strlen(ext) &&
-                safe.compare(safe.size()-std::strlen(ext), std::strlen(ext), ext) == 0)
-            { safe.resize(safe.size()-std::strlen(ext)); break; }
-        std::string so_path = g_cache_dir + "/" + safe + ".so";
+        if (!state.handle || state.so_path.empty()) return;
+        // Reuse so_path stored by compile_and_load_blob (includes source_hash suffix).
         state.fn_ws_host_size = find_sym_by_prefix(
-            state.handle, so_path.c_str(),
+            state.handle, state.so_path.c_str(),
             "_Z34fmha_bwd_dq_dk_dv_dq_ws_host_size_I");
         state.fn_ws_device_upper_bound = find_sym_by_prefix(
-            state.handle, so_path.c_str(),
+            state.handle, state.so_path.c_str(),
             "_Z43fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_I");
         state.fn_prepare_ws_host = find_sym_by_prefix(
-            state.handle, so_path.c_str(),
+            state.handle, state.so_path.c_str(),
             "_Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I");
     });
 }

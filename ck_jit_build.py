@@ -27,8 +27,8 @@
 import contextlib
 import fcntl
 import json
-import multiprocessing
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -486,6 +486,16 @@ def cmd_full(args):
         qola_dir      = args.qola_dir
         qola_manifest = args.qola_manifest
         qola_output   = args.qola_output
+
+    # Validate CK_JIT_EXTRA_CACHE_KEY before starting the build.
+    _extra_key = os.environ.get("CK_JIT_EXTRA_CACHE_KEY", "")
+    if _extra_key and not re.fullmatch(r"[a-z0-9]{1,8}", _extra_key):
+        print(
+            f"{_TAG} ERROR: CK_JIT_EXTRA_CACHE_KEY={_extra_key} is invalid."
+            " Must be up to 8 lowercase alphanumeric characters (a-z, 0-9).",
+            file=sys.stderr
+        )
+        return 1
 
     interceptor  = os.path.join(_SCRIPT_DIR, "ck_build_interceptor.py")
     runtime_src  = os.path.join(_SCRIPT_DIR, "ck_jit_runtime.cpp")
