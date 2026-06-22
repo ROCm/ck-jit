@@ -573,6 +573,22 @@ def cmd_full(args):
     })
 
     ck_submodule = os.path.join(aiter_dir, "3rdparty", "composable_kernel")
+
+    # Determine CK commit to use as the primary blob cache key.
+    # Passed to ck_build_interceptor.py via CK_JIT_CK_COMMIT; the interceptor
+    # falls back to SHA256(source) when this var is absent or empty.
+    _r = subprocess.run(
+        ["git", "-C", ck_submodule, "rev-parse", "--short=8", "HEAD"],
+        capture_output=True, text=True, check=False
+    )
+    ck_commit = _r.stdout.strip() if _r.returncode == 0 else ""
+    if ck_commit:
+        print(f"{_TAG} CK commit: {ck_commit}")
+    else:
+        print(f"{_TAG} WARNING: cannot determine CK commit; "
+              "blob source hash will be used as cache key fallback", file=sys.stderr)
+    env["CK_JIT_CK_COMMIT"] = ck_commit
+
     with ck_build_lock(ck_submodule):
         patch = _select_codegen_patch(ck_submodule)
         if not _apply_codegen_patch(ck_submodule, patch):

@@ -55,19 +55,29 @@ AITER_DIR   = os.environ.get("CK_JIT_AITER_DIR", "")
 
 def compute_blob_hash(source_abs):
     """
-    Return a 8-hex-character SHA-256 digest of the blob source file
-    plus optional tail from CK_JIT_EXTRA_CACHE_KEY.
+    Return the cache key for a blob source file.
 
-    CK_JIT_EXTRA_CACHE_KEY (env) is folded in so app developers can force
-    a full cache rebuild after a CK version bump without touching source.
+    Primary key:  CK_JIT_CK_COMMIT (8-char git short hash), set by
+    ck_jit_build.py before invoking the interceptor.  It covers both
+    source and header changes for any committed CK state.
+
+    Fallback key: SHA256(source)[:8], used when CK_JIT_CK_COMMIT is
+    absent or empty (e.g. standalone interceptor usage).
+
+    CK_JIT_EXTRA_CACHE_KEY is appended verbatim to either form.
+    Cache filename: <stem>.so.<ck_commit|sha256>[.<extra_key>]
     """
-    h = hashlib.sha256()
-    try:
-        with open(source_abs, 'rb') as f:
-            h.update(f.read())
-    except OSError:
-        pass
-    key = h.hexdigest()[:8]
+    ck_commit = os.environ.get('CK_JIT_CK_COMMIT', '')
+    if ck_commit:
+        key = ck_commit
+    else:
+        h = hashlib.sha256()
+        try:
+            with open(source_abs, 'rb') as f:
+                h.update(f.read())
+        except OSError:
+            pass
+        key = h.hexdigest()[:8]
     extra = os.environ.get('CK_JIT_EXTRA_CACHE_KEY', '')
     if extra:
         key += '.' + extra
