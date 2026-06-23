@@ -51,11 +51,9 @@ def load_manifest(path):
 # ---------------------------------------------------------------------------
 
 def _extract_ld_flags(link_argv):
-    """Carry over linker flags ck_jit's link reconstruction would otherwise drop.
-
-    Currently symbol-visibility flags (version script, exclude-libs); kept generic
-    for future extension. Read directly from link_argv (passed on the command
-    line, not via a ninja response file).
+    """
+    Carry over linker flags ck_jit's link reconstruction would otherwise drop.
+    Read directly from link_argv passed on the command line.
     """
     flags = []
     i = 0
@@ -506,7 +504,7 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
     out_so   = _abs(st["out_so"])
     all_objs = [_abs(o) for o in st["all_objs"]]
     arch_fl  = st["arch_fl"]
-    ld_fl    = st.get("ld_fl", [])  # visibility ldflags; absent in pre-fix state
+    ld_fl    = st.get("ld_fl", [])
     is_fwd   = "libmha_fwd" in os.path.basename(out_so)
 
     jit_name = st.get("jit_name", "")
