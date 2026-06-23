@@ -74,6 +74,38 @@ def _filter_names_by_arch(names, arch):
     return kept
 
 
+def filter_offload_arch_flags(argv, name):
+    """
+    Return argv with --offload-arch flags restricted to the blob's arch family
+    (derived from the filename suffix via _arch_suffix_from_name + _family_matches).
+
+    For arch-agnostic blobs (no gfx suffix in name) all flags are kept unchanged.
+    Safety fallback: if no matching --offload-arch flag is found (single-arch build
+    that was already correct), the original argv is returned unchanged.
+    """
+    blob_suffix = _arch_suffix_from_name(name)
+    if not blob_suffix:
+        return list(argv)
+    filtered, kept_any = [], False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--offload-arch" and i + 1 < len(argv):
+            if _family_matches(blob_suffix, argv[i + 1]):
+                filtered.extend([a, argv[i + 1]])
+                kept_any = True
+            i += 2
+        elif a.startswith("--offload-arch="):
+            if _family_matches(blob_suffix, a[len("--offload-arch="):]):
+                filtered.append(a)
+                kept_any = True
+            i += 1
+        else:
+            filtered.append(a)
+            i += 1
+    return filtered if kept_any else list(argv)
+
+
 # ---------------------------------------------------------------------------
 # ROCm / hipcc discovery
 # ---------------------------------------------------------------------------

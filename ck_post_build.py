@@ -23,7 +23,7 @@ import shlex
 import subprocess
 import sys
 
-from ck_jit_utils import _arch_suffix_from_name, _family_matches, find_rocm
+from ck_jit_utils import filter_offload_arch_flags, find_rocm
 
 # ---------------------------------------------------------------------------
 # Manifest helpers
@@ -75,63 +75,15 @@ def link_so(hipcc, objs, out_path, arch_flags_list, rocm_lib_dir, verbose=False)
 
 def _entry_flags(entry):
     """
-    Return compile flags for the embedded manifest header (ck_jit_manifest_embedded.h).
+    Return compile flags string for the embedded manifest header.
 
-    argv already contains flags only (source, output, -c, and visibility flags
-    were stripped at manifest-write time by ck_build_interceptor.py).
-
-    For arch-specific blobs (fmha_fwd / fmha_bwd / fmha_fwd_splitkv), the CK
-    build passes ALL --offload-arch targets to every blob compile, regardless of
-    which arch family the blob is for.  At JIT-compile time (runtime) we only
-    want to compile the blob for the arch(es) that will actually dispatch to it.
-
-    This function filters --offload-arch flags to keep only those whose concrete
-    arch belongs to the blob's family (derived from the filename suffix), removing
-    unnecessary device-compile passes for unrelated architectures.
-
-    For arch-agnostic blobs (fmha_batch_prefill, no _gfx suffix in filename),
-    all --offload-arch flags are kept; the runtime GPU arch is determined by the
-    API dispatcher at call time.
+    Delegates to ck_jit_utils.filter_offload_arch_flags, which restricts
+    --offload-arch flags to those matching the blob's arch family.
+    Arch-agnostic blobs (no gfx suffix) keep all flags unchanged.
     """
     argv = entry.get("argv", [])
     name = entry.get("source", "") or entry.get("name", "")
-    blob_suffix = _arch_suffix_from_name(name)
-
-    if not blob_suffix:
-        # Arch-agnostic blob (batch_prefill): keep all flags unchanged.
-        return " ".join(argv)
-
-    # Arch-specific blob: filter --offload-arch to keep only flags for archs
-    # that belong to this blob's family.  Within the same family (e.g. gfx942
-    # and gfx90a both in gfx9), multiple flags are kept — the runtime GPU
-    # within that family needs to compile for its own concrete arch.
-    filtered = []
-    kept_any_arch = False
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--offload-arch" and i + 1 < len(argv):
-            val = argv[i + 1]
-            if _family_matches(blob_suffix, val):
-                filtered.extend([a, val])
-                kept_any_arch = True
-            i += 2
-        elif a.startswith("--offload-arch="):
-            val = a[len("--offload-arch="):]
-            if _family_matches(blob_suffix, val):
-                filtered.append(a)
-                kept_any_arch = True
-            i += 1
-        else:
-            filtered.append(a)
-            i += 1
-
-    # Safety: if the manifest had no matching --offload-arch at all (e.g. a
-    # single-arch build that was already correct), fall back to original flags.
-    if not kept_any_arch:
-        return " ".join(argv)
-
-    return " ".join(filtered)
+    return " ".join(filter_offload_arch_flags(argv, name))
 
 
 def generate_embedded_header(entries, embedded_h, is_fwd):
