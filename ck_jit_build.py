@@ -27,8 +27,8 @@
 import contextlib
 import fcntl
 import json
-import multiprocessing
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -309,12 +309,15 @@ def _run_parallel_compile(env, compile_py, tmp_dir):
 def _run_qola_compile(env, qola_dir, qola_manifest, qola_output, aiter_dir, tmp_dir, gpu_archs):
     log = os.path.join(tmp_dir, "qola_build.log")
     with open(log, "w", encoding="utf-8") as lf:
+        # CK_JIT needs CK source be available before the build, so we rely on the caller
+        # to do QoLA checkout before calling this script and use --skip-checkout here
         r = subprocess.run(
             [sys.executable, "-m", "qola.cli", "build",
             "--manifest", qola_manifest,
             "--aiter-root", aiter_dir,
             "--output-dir", qola_output or os.path.join(tmp_dir, "qola"),
             "--arch", gpu_archs,
+            "--skip-checkout",
             ],
             cwd=qola_dir,
             env=env,
@@ -484,6 +487,16 @@ def cmd_full(args):
         qola_manifest = args.qola_manifest
         qola_output   = args.qola_output
 
+    # Validate CK_JIT_EXTRA_CACHE_KEY before starting the build.
+    _extra_key = os.environ.get("CK_JIT_EXTRA_CACHE_KEY", "")
+    if _extra_key and not re.fullmatch(r"[a-z0-9]{1,8}", _extra_key):
+        print(
+            f"{_TAG} ERROR: CK_JIT_EXTRA_CACHE_KEY={_extra_key} is invalid."
+            " Must be up to 8 lowercase alphanumeric characters (a-z, 0-9).",
+            file=sys.stderr
+        )
+        return 1
+
     interceptor  = os.path.join(_SCRIPT_DIR, "ck_build_interceptor.py")
     runtime_src  = os.path.join(_SCRIPT_DIR, "ck_jit_runtime.cpp")
     build_script = os.path.join(_SCRIPT_DIR, "ck_jit_compile.sh")
@@ -560,6 +573,22 @@ def cmd_full(args):
     })
 
     ck_submodule = os.path.join(aiter_dir, "3rdparty", "composable_kernel")
+
+    # Determine CK commit to use as the primary blob cache key.
+    # Passed to ck_build_interceptor.py via CK_JIT_CK_COMMIT; the interceptor
+    # falls back to SHA256(source) when this var is absent or empty.
+    _r = subprocess.run(
+        ["git", "-C", ck_submodule, "rev-parse", "--short=8", "HEAD"],
+        capture_output=True, text=True, check=False
+    )
+    ck_commit = _r.stdout.strip() if _r.returncode == 0 else ""
+    if ck_commit:
+        print(f"{_TAG} CK commit: {ck_commit}")
+    else:
+        print(f"{_TAG} WARNING: cannot determine CK commit; "
+              "blob source hash will be used as cache key fallback", file=sys.stderr)
+    env["CK_JIT_CK_COMMIT"] = ck_commit
+
     with ck_build_lock(ck_submodule):
         patch = _select_codegen_patch(ck_submodule)
         if not _apply_codegen_patch(ck_submodule, patch):
