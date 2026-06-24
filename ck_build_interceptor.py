@@ -34,6 +34,7 @@
 #                         relative to this dir to keep entries short and portable.
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -46,6 +47,41 @@ import sys
 REAL_HIPCC  = os.environ.get("CK_JIT_HIPCC", "")
 JIT_TMP_DIR = os.environ.get("CK_JIT_TMP_DIR", "/tmp/ck_jit")
 AITER_DIR   = os.environ.get("CK_JIT_AITER_DIR", "")
+
+
+# ---------------------------------------------------------------------------
+# Blob source hash
+# ---------------------------------------------------------------------------
+
+def compute_blob_hash(source_abs):
+    """
+    Return the cache key for a blob source file.
+
+    Primary key:  CK_JIT_CK_COMMIT (8-char git short hash), set by
+    ck_jit_build.py before invoking the interceptor.  It covers both
+    source and header changes for any committed CK state.
+
+    Fallback key: SHA256(source)[:8], used when CK_JIT_CK_COMMIT is
+    absent or empty (e.g. standalone interceptor usage).
+
+    CK_JIT_EXTRA_CACHE_KEY is appended verbatim to either form.
+    Cache filename: <stem>.so.<ck_commit|sha256>[.<extra_key>]
+    """
+    ck_commit = os.environ.get('CK_JIT_CK_COMMIT', '')
+    if ck_commit:
+        key = ck_commit
+    else:
+        h = hashlib.sha256()
+        try:
+            with open(source_abs, 'rb') as f:
+                h.update(f.read())
+        except OSError:
+            pass
+        key = h.hexdigest()[:8]
+    extra = os.environ.get('CK_JIT_EXTRA_CACHE_KEY', '')
+    if extra:
+        key += '.' + extra
+    return key
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -331,6 +367,13 @@ def _handle_api_source(argv, source_abs, output_abs, basename):
 
 def main():
     argv = sys.argv[:]
+
+    # Version/info queries (e.g. -v, --version) from tools like AITER's ABI
+    # checker must go straight to the real compiler — don't route through
+    # _handle_link_step which may fail when there's no -o argument.
+    if len(argv) == 2 and argv[1] in ("-v", "-V", "--version", "--help"):
+        return run_real_compiler(argv)
+
     source, output = parse_compile_command(argv)
 
     if source is None or output is None:
@@ -353,10 +396,11 @@ def main():
     if is_blob:
         # Blobs: record manifest entry, write zero-byte stub (compiled on demand at runtime).
         entry = {
-            "source": source_abs,
-            "cwd":    _rel(os.getcwd()),
-            "argv":   _extract_flags(argv, source, source_abs, output, output_abs),
-            "kind":   "blob",
+            "source":      source_abs,
+            "cwd":         _rel(os.getcwd()),
+            "argv":        _extract_flags(argv, source, source_abs, output, output_abs),
+            "kind":        "blob",
+            "source_hash": compute_blob_hash(source_abs),
         }
         append_to_manifest(entry)
         print(f"[CK-JIT] Intercepted blob: {basename} → stub", file=sys.stderr)

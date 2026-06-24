@@ -198,7 +198,7 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
     Returns (blob_name, ok, message).
     """
     blob_name = _norm_name(entry.get("name"))
-    so_path   = os.path.join(cache_dir, blob_name + ".so")
+    so_path   = os.path.join(cache_dir, blob_name + ".so." + entry.get("source_hash"))
 
     if not force and os.path.exists(so_path):
         return blob_name, True, "cached"
