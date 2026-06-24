@@ -103,6 +103,20 @@ def _default_cache_dir(manifest_path):
     return os.path.join(base, name)
 
 
+def _manifest_valid_names(manifest_path):
+    """
+    Return the set of expected cache filenames (<stem>.so.<source_hash>)
+    for all blob entries in the manifest.  Used to distinguish current from
+    stale cache files.
+    """
+    entries = load_manifest(manifest_path) if os.path.exists(manifest_path) else []
+    return {
+        _norm_name(e["name"]) + ".so." + e["source_hash"]
+        for e in entries
+        if e.get("kind") == "blob" and e.get("name") and e.get("source_hash")
+    }
+
+
 # ---------------------------------------------------------------------------
 # Blob lookup
 # ---------------------------------------------------------------------------
@@ -290,15 +304,19 @@ def cmd_list(args):
 
     found, missing = resolve_blobs(names, index)
 
-    arch_tag = f" (arch={arch})" if arch else ""
-    print(f"Found{arch_tag}:   {len(found)}")
-    print(f"Missing:  {len(missing)}")
-
-    for e in found:
-        archs = " ".join(sorted(_entry_archs(e)))
-        print(f"  + {_norm_name(e['name'])}  [{archs}]")
-    for name in missing:
-        print(f"  - {name}  (not in manifest)")
+    fmt = getattr(args, "format", "human")
+    if fmt == "blob-list":
+        for e in found:
+            print(_norm_name(e["name"]))
+    else:
+        arch_tag = f" (arch={arch})" if arch else ""
+        print(f"Found{arch_tag}:   {len(found)}")
+        print(f"Missing:  {len(missing)}")
+        for e in found:
+            archs = " ".join(sorted(_entry_archs(e)))
+            print(f"  + {_norm_name(e['name'])}  [{archs}]")
+        for name in missing:
+            print(f"  - {name}  (not in manifest)")
 
     return 1 if missing else 0
 
@@ -330,7 +348,8 @@ def cmd_build(args):
         print(f"{_TAG} Nothing to build.")
         return 1
 
-    cache_dir = args.cache_dir or _default_cache_dir(args.manifest)
+    cache_dir = os.path.abspath(args.cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
 
     _found_hipcc, _rocm_root = find_rocm()
     hipcc    = args.hipcc or _found_hipcc
@@ -338,9 +357,7 @@ def cmd_build(args):
     root = args.root or os.environ.get(
         "CK_JIT_ROOT", os.path.dirname(os.path.abspath(__file__))
     )
-    jobs     = args.jobs
-    cache_dir = os.path.abspath(cache_dir)
-    os.makedirs(cache_dir, exist_ok=True)
+    jobs = args.jobs
 
     if not hipcc:
         print(f"{_TAG} ERROR: hipcc not found. Set ROCM_PATH or pass --hipcc.",
@@ -383,14 +400,20 @@ def cmd_build(args):
 # ---------------------------------------------------------------------------
 
 def cmd_cache(args):
-    cache_dir = os.path.abspath(args.cache_dir or _default_cache_dir(args.manifest))
-    sos = sorted(_glob.glob(os.path.join(cache_dir, "*.so")))
+    cache_dir = os.path.abspath(args.cache_dir)
+    sos = sorted(_glob.glob(os.path.join(cache_dir, "*.so.*")))
 
     fmt = getattr(args, "format", "human")
     write_blob_list = getattr(args, "write_blob_list", None)
 
-    # Collect bare stem names (strip .so) for blob-list output.
-    stems = [os.path.basename(p)[:-3] for p in sos]  # remove ".so"
+    # --current: keep only files that correspond to an entry in the current manifest
+    # (blob name + source_hash both match). Manifest path comes from global --manifest.
+    if getattr(args, "current", False):
+        valid_names = _manifest_valid_names(args.manifest)
+        sos = [p for p in sos if os.path.basename(p) in valid_names]
+
+    # Collect unique blob stem names for blob-list output.
+    stems = sorted(set(_norm_name(p) for p in sos))
 
     if fmt == "blob-list":
         # Machine-readable: one stem per line, no header, suitable for --blob-list.
@@ -418,43 +441,29 @@ def cmd_cache(args):
 # ---------------------------------------------------------------------------
 
 def cmd_clean(args):
-    cache_dir = os.path.abspath(args.cache_dir or _default_cache_dir(args.manifest))
+    cache_dir = os.path.abspath(args.cache_dir)
 
-    if args.all:
-        # Wipe every .so (and its .o) in the cache dir.
+    if getattr(args, "stalled", False):
+        # Remove only cache files that do not match the current manifest.
+        valid_names = _manifest_valid_names(args.manifest)
+        targets = [p for p in _glob.glob(os.path.join(cache_dir, "*.so.*"))
+                   if os.path.basename(p) not in valid_names]
+        if not targets:
+            print(f"{_TAG} No stale entries in {cache_dir}.")
+            return 0
+    else:
+        # Default: remove all cached .so files.
         targets = (_glob.glob(os.path.join(cache_dir, "*.so")) +
                    _glob.glob(os.path.join(cache_dir, "*.so.*")))
         if not targets:
             print(f"{_TAG} Nothing to clean in {cache_dir}.")
             return 0
-        for p in targets:
-            os.remove(p)
-            if args.verbose:
-                print(f"{_TAG} Removed {p}")
-        print(f"{_TAG} Cleaned {len(targets)} file(s) from {cache_dir}.")
-        return 0
 
-    # Clean specific blobs.
-    entries = load_manifest(args.manifest) if os.path.exists(args.manifest) else []
-    index   = _build_index(entries)
-    names   = collect_blob_names(args.blob, args.blob_list, False, args.blobs, index)
-    if not names:
-        print(f"{_TAG} No blobs specified. Use --blob, --blob-list, --all, "
-              "or positional args.", file=sys.stderr)
-        return 1
-
-    removed = 0
-    for name in names:
-        key = _norm_name(name)
-        for p in ([os.path.join(cache_dir, key + ".so")] +
-                  _glob.glob(os.path.join(cache_dir, key + ".so.*"))):
-            if os.path.exists(p):
-                os.remove(p)
-                if args.verbose:
-                    print(f"{_TAG} Removed {p}")
-                removed += 1
-
-    print(f"{_TAG} Removed {removed} file(s).")
+    for p in targets:
+        os.remove(p)
+        if args.verbose:
+            print(f"{_TAG} Removed {p}")
+    print(f"{_TAG} Removed {len(targets)} file(s) from {cache_dir}.")
     return 0
 
 
@@ -482,9 +491,17 @@ def main():
         os.environ.get("CK_JIT_MANIFEST") or
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "ck_jit_manifest.json")
     )
+    _default_cache = (
+        os.environ.get("CK_JIT_CACHE_DIR") or
+        _default_cache_dir(_default_manifest)
+    )
     ap.add_argument("--manifest", default=_default_manifest,
                     help="Path to ck_jit_manifest.json "
                          "(default: $CK_JIT_MANIFEST or <script-dir>/ck_jit_manifest.json).")
+    ap.add_argument("--cache-dir", default=_default_cache,
+                    help="Directory for compiled .so cache files "
+                         "(default: $CK_JIT_CACHE_DIR, then $XDG_CACHE_HOME/<name> "
+                         "from ck_jit_config.json, then ~/.cache/<name>).")
     sub = ap.add_subparsers(dest="command", required=True)
 
     # ---- list ----
@@ -492,14 +509,14 @@ def main():
     lp.add_argument("--arch", default="",
                     help="Filter blobs by GPU architecture (e.g. gfx942). "
                          "Only blobs compiled for this arch are shown.")
+    lp.add_argument("--format", choices=["human", "blob-list"], default="human",
+                    help="Output format: 'human' (default) prints a summary with arch info; "
+                         "'blob-list' prints one bare blob stem per line (found blobs only), "
+                         "suitable for piping into 'build --blob-list -'.")
     _add_blob_args(lp)
 
     # ---- build ----
     bp = sub.add_parser("build", help="Compile requested blobs into cache dir.")
-    bp.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
-                    help="Output directory for compiled .so files "
-                         "(default: $CK_JIT_CACHE_DIR, then $XDG_CACHE_HOME/<name> "
-                         "from ck_jit_config.json, then ~/.cache/<name>).")
     bp.add_argument("--root", default="",
                     help="AITER root dir for resolving relative manifest paths "
                          "(default: $CK_JIT_ROOT, then the script dir).")
@@ -526,9 +543,6 @@ def main():
 
     # ---- cache ----
     cachep = sub.add_parser("cache", help="List compiled .so files in the cache directory.")
-    cachep.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
-                        help="Cache directory to inspect "
-                             "(default: same resolution as build --cache-dir).")
     cachep.add_argument("--format", choices=["human", "blob-list"], default="human",
                         help="Output format: 'human' (default) prints a table with sizes; "
                              "'blob-list' prints one bare blob stem per line, suitable for "
@@ -538,15 +552,19 @@ def main():
                              "(one name per line). May be combined with --format human "
                              "to keep the human-readable output on stdout while also "
                              "generating the file.")
+    cachep.add_argument("--current", action="store_true",
+                        help="Show only cache entries whose source_hash matches the current "
+                             "manifest (name + source_hash must match). Uses the manifest "
+                             "from the global --manifest argument.")
 
     # ---- clean ----
     cp = sub.add_parser("clean", help="Remove cached .so (and .o) files.")
-    cp.add_argument("--cache-dir", default=os.environ.get("CK_JIT_CACHE_DIR"),
-                    help="Cache directory to clean "
-                         "(default: same resolution as build --cache-dir).")
+    cp.add_argument("--stalled", action="store_true",
+                    help="Remove cache entries whose source_hash does not match the current "
+                         "manifest (stale entries from older CK versions). The manifest is "
+                         "taken from the global --manifest argument.")
     cp.add_argument("--verbose", action="store_true",
                     help="Print each removed file path.")
-    _add_blob_args(cp)
 
     args = ap.parse_args()
 
