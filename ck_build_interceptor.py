@@ -372,6 +372,14 @@ def main():
     # checker must go straight to the real compiler — don't route through
     # _handle_link_step which may fail when there's no -o argument.
     if len(argv) == 2 and argv[1] in ("-v", "-V", "--version", "--help"):
+        # In CXX role (not hipcc), CK_JIT_CXX may be hipcc captured from the
+        # outer build env.  hipcc requires a real ROCM_PATH, but we've set
+        # ROCM_PATH to a fake directory, so "hipcc -v" fails.  Use the system
+        # C++ compiler directly for version probes; it always succeeds and
+        # gives AITER's ABI checker a usable answer.
+        if os.path.basename(argv[0]) not in {"hipcc", "ck_build_interceptor.py"}:
+            compiler = _find_cxx()
+            return subprocess.run([compiler] + argv[1:], check=False).returncode
         return run_real_compiler(argv)
 
     source, output = parse_compile_command(argv)
