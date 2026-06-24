@@ -20,9 +20,10 @@
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
+
+from ck_jit_utils import filter_offload_arch_flags, find_rocm
 
 # ---------------------------------------------------------------------------
 # Manifest helpers
@@ -90,16 +91,22 @@ def link_so(hipcc, objs, out_path, ld_flags, rocm_lib_dir, verbose=False):
     return r.returncode
 
 
+
 # ---------------------------------------------------------------------------
 # Embedded manifest header generation
 # ---------------------------------------------------------------------------
 
 def _entry_flags(entry):
-    """Space-joined compile flags from the manifest entry's 'argv' field.
-    argv now contains flags only (source, output, -c, and visibility flags
-    were stripped at manifest-write time by ck_build_interceptor.py).
     """
-    return " ".join(entry.get("argv", []))
+    Return compile flags string for the embedded manifest header.
+
+    Delegates to ck_jit_utils.filter_offload_arch_flags, which restricts
+    --offload-arch flags to those matching the blob's arch family.
+    Arch-agnostic blobs (no gfx suffix) keep all flags unchanged.
+    """
+    argv = entry.get("argv", [])
+    name = entry.get("source", "") or entry.get("name", "")
+    return " ".join(filter_offload_arch_flags(argv, name))
 
 
 def generate_embedded_header(entries, embedded_h, is_fwd):
@@ -141,30 +148,6 @@ def generate_embedded_header(entries, embedded_h, is_fwd):
 # ---------------------------------------------------------------------------
 # Shared helpers for build_lib and quick_rebuild_lib
 # ---------------------------------------------------------------------------
-
-def _find_rocm(hipcc=""):
-    """Locate hipcc and ROCm dir.
-
-    If hipcc is already known, derives rocm dir from its path.
-    Otherwise scans ROCM_HOME / ROCM_PATH / /opt/rocm, then PATH.
-    Returns (hipcc, rocm_dir).
-    """
-    for rocm_root in (os.path.dirname(os.path.dirname(os.path.abspath(hipcc))) if hipcc else "",
-                      os.environ.get("ROCM_HOME", ""),
-                      os.environ.get("ROCM_PATH", ""),
-                      "/opt/rocm"):
-        if not rocm_root:
-            continue
-        if not os.path.isdir(os.path.join(rocm_root, "lib")) or not os.path.isdir(
-            os.path.join(rocm_root, "include")
-        ):
-            continue
-        if not hipcc and os.access(os.path.join(rocm_root, "bin", "hipcc"), os.X_OK):
-            hipcc = os.path.join(rocm_root, "bin", "hipcc")
-        break
-    if not hipcc:
-        hipcc = shutil.which("hipcc") or ""
-    return hipcc, rocm_root
 
 
 def _derive_includes(aiter_dir, rocm_root):
@@ -381,7 +364,7 @@ def build_lib(out_so, link_argv, jit_tmp_dir,
     print(f"{tag} Arch flags: {arch_fl}", file=sys.stderr)
 
     # ---- ROCm lib dir and include paths ----
-    _, rocm_root = _find_rocm(hipcc)
+    _, rocm_root = find_rocm(hipcc)
     ck_include, aiter_include, rocm_include, ck_fmha_include = _derive_includes(
         aiter_dir, rocm_root)
 
@@ -527,7 +510,7 @@ def quick_rebuild_lib(state_path, verbose=False, aiter_dir=""):
         os.environ["CK_JIT_NAME"] = jit_name
 
     # ---- Locate hipcc, ROCm dir, and include paths ----
-    hipcc, rocm_root = _find_rocm()
+    hipcc, rocm_root = find_rocm()
     if not hipcc:
         print(f"{tag} ERROR: hipcc not found.", file=sys.stderr)
         return 1, None

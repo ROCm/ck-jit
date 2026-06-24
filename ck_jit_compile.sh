@@ -59,16 +59,27 @@ fi
 
 log() { [[ "$VERBOSE" -eq 1 ]] && echo "[CK-JIT-BUILD] $*" >&2 || true; }
 
+# Temp files that may be left behind if the process is killed mid-compilation;
+# cleaned up by the EXIT trap below.  _TMP_SO is set by atomic_link_so before
+# the hipcc link step so that a SIGTERM/SIGINT received during compilation
+# still removes the partial temp file.
+_TMP_SO=""
+_LOOKUP_TMP=""
+_cleanup_tmps() { rm -f "$_TMP_SO" "$_LOOKUP_TMP"; }
+trap _cleanup_tmps EXIT
+
 # Link to a temp file beside the destination, then atomically rename.
 # If the destination already exists (race), discard the temp and succeed.
 atomic_link_so() {
-  local tmp
-  tmp="$(mktemp "${OUTPUT}.XXXXXX")"
+  _TMP_SO="$(mktemp "${OUTPUT}.XXXXXX")"
   # shellcheck disable=SC2086
-  if "$HIPCC_BIN" -shared -fPIC "$@" -o "$tmp"; then
-    mv -n "$tmp" "$OUTPUT" || rm -f "$tmp"
+  if "$HIPCC_BIN" -shared -fPIC "$@" -o "$_TMP_SO"; then
+    mv -n "$_TMP_SO" "$OUTPUT"
+    rm -f "$_TMP_SO"  # no-op if mv moved it; removes stale temp on no-clobber
+    _TMP_SO=""
   else
-    rm -f "$tmp"
+    rm -f "$_TMP_SO"
+    _TMP_SO=""
     return 1
   fi
 }
@@ -126,8 +137,7 @@ fi
 
 echo "[CK-JIT-BUILD] manifest : $MANIFEST" >&2
 
-LOOKUP_TMP="$(mktemp)"
-trap 'rm -f "$LOOKUP_TMP"' EXIT
+_LOOKUP_TMP="$(mktemp)"
 
 python3 -c "
 import json, os, sys
@@ -147,10 +157,10 @@ e = matches[0]
 src = os.path.join(root, 'blobs', e['name']) if root else os.path.join('blobs', e['name'])
 print(src)
 print(' '.join(e.get('argv', [])))
-" "$MANIFEST" "$BLOB_NAME" "$ROOT_DIR" > "$LOOKUP_TMP" || exit 1
+" "$MANIFEST" "$BLOB_NAME" "$ROOT_DIR" > "$_LOOKUP_TMP" || exit 1
 
-BLOB_SOURCE="$(sed -n '1p' "$LOOKUP_TMP")"
-BLOB_FLAGS="$(sed -n '2p' "$LOOKUP_TMP")"
+BLOB_SOURCE="$(sed -n '1p' "$_LOOKUP_TMP")"
+BLOB_FLAGS="$(sed -n '2p' "$_LOOKUP_TMP")"
 log "Manifest mode resolved: $BLOB_SOURCE"
 
 # Run from ROOT_DIR so relative -I paths in flags resolve correctly.

@@ -35,6 +35,8 @@ import subprocess
 import sys
 import tempfile
 
+from ck_jit_utils import filter_offload_arch_flags
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TAG = "[CK-JIT]"
 
@@ -394,7 +396,7 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name):
     os.makedirs(jit_artifact_dir, exist_ok=True)
 
     # Copy runtime scripts.
-    for name in ("ck_jit_compile.sh", "ck_jit_prebuild.py"):
+    for name in ("ck_jit_compile.sh", "ck_jit_prebuild.py", "ck_jit_utils.py"):
         dst = os.path.join(jit_artifact_dir, name)
         shutil.copy2(os.path.join(_SCRIPT_DIR, name), dst)
         os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -435,6 +437,10 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name):
                 # consumers derive the path as blobs/<name> relative to CK_JIT_ROOT.
                 entry = {k: v for k, v in entry.items() if k != "source"}
                 entry["name"] = basename
+                # Filter --offload-arch flags to only those matching the blob's
+                # arch family so every consumer of ck_jit_manifest.json gets
+                # correct, single-family compile flags without further filtering.
+                entry["argv"] = filter_offload_arch_flags(entry.get("argv", []), basename)
 
             entries.append(entry)
 
