@@ -530,6 +530,9 @@ def cmd_full(args):
         return 1
     print(f"{_TAG} Real hipcc: {real_hipcc}")
 
+    real_cxx = os.environ.get("CXX") or "c++"
+    print(f"{_TAG} Real CXX: {real_cxx}")
+
     # Resolve tmp_dir.
     _tmp_owner = None
     if not tmp_dir:
@@ -544,9 +547,8 @@ def cmd_full(args):
     print(f"{_TAG} JIT tmp dir: {tmp_dir}")
 
     # Create fake ROCm.
-    fake_rocm, fake_hipcc, fake_cxx = _create_fake_rocm(real_rocm, tmp_dir, interceptor)
+    fake_rocm, _, fake_cxx = _create_fake_rocm(real_rocm, tmp_dir, interceptor)
     print(f"{_TAG} Fake ROCm home : {fake_rocm}")
-    print(f"{_TAG} Fake hipcc     : {fake_hipcc}")
 
     # Clear prior aiter JIT build.
     aiter_jit_build = os.path.join(aiter_dir, "aiter", "jit", "build")
@@ -557,9 +559,6 @@ def cmd_full(args):
     compile_py       = os.path.join(aiter_test_dir, "compile.py")
     ck_include_dir   = os.path.join(aiter_dir, "3rdparty", "composable_kernel", "include")
     aiter_include_dir = os.path.join(aiter_dir, "csrc", "include")
-
-    # Capture real CXX before we override it.
-    real_cxx = os.environ.get("CXX") or "c++"
 
     env = os.environ.copy()
     env.update({
@@ -707,7 +706,7 @@ def main():
     jp.add_argument("--qola-dir", default="",
                     help="Path to QoLA root (required with --with-qola).")
     jp.add_argument("--qola-manifest", default="",
-                    help="Path to QoLA manifest .toml (default: qola_manifest.toml next to this script).")
+                    help="Path to QoLA manifest .toml (required with --with-qola).")
     jp.add_argument("--qola-output", default="",
                     help="Override QoLA --output-dir (default: <tmp-dir>/qola).")
     jp.add_argument("--jit-name", default="ck_jit",
