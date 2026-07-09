@@ -127,7 +127,7 @@ struct BwdDqBlobState : BlobState {
     std::once_flag  ws_meta_init_flag;
     void*           fn_ws_host_size          = nullptr;  // dq_ws_host_size_<>
     void*           fn_ws_device_upper_bound = nullptr;  // dq_ws_device_upper_bound_<>
-    void*           fn_prepare_ws_host       = nullptr;  // dq_prepare_ws_host_<>
+    void*           fn_prepare_ws_device     = nullptr;  // dq_prepare_ws_device_<>
 #endif
 };
 
@@ -649,14 +649,14 @@ static void resolve_bwd_dq_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state
 // "[CK_TILE] Use Unified Workspace for FMHA BWD"
 //
 // Resolves three new symbols from the dq_dk_dv blob:
-//   fmha_bwd_dq_dk_dv_dq_ws_host_size_<T,Arch>(int batch)      → size_t
-//   fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_<T,Arch>(...)   → size_t
-//   fmha_bwd_dq_dk_dv_dq_prepare_ws_host_<T,Arch>(void*,...)   → size_t
+//   fmha_bwd_dq_dk_dv_dq_ws_host_size_<T,Arch>(int batch)       → size_t
+//   fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_<T,Arch>(...)    → size_t
+//   fmha_bwd_dq_dk_dv_dq_prepare_ws_device_<T,Arch>(void*,...)  → void (launches kernel)
 //
 // ELF mangled-name prefixes (Itanium ABI, template function length prefix):
 //   _Z34fmha_bwd_dq_dk_dv_dq_ws_host_size_I          (34 chars)
 //   _Z43fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_I  (43 chars)
-//   _Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I        (37 chars)
+//   _Z39fmha_bwd_dq_dk_dv_dq_prepare_ws_device_I      (39 chars)
 // ---------------------------------------------------------------------------
 static void resolve_bwd_dq_ws_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state)
 {
@@ -675,9 +675,9 @@ static void resolve_bwd_dq_ws_meta(const char* dq_dk_dv_blob, BwdDqBlobState& st
         state.fn_ws_device_upper_bound = find_sym_by_prefix(
             state.handle, state.so_path.c_str(),
             "_Z43fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_I");
-        state.fn_prepare_ws_host = find_sym_by_prefix(
+        state.fn_prepare_ws_device = find_sym_by_prefix(
             state.handle, state.so_path.c_str(),
-            "_Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I");
+            "_Z39fmha_bwd_dq_dk_dv_dq_prepare_ws_device_I");
     });
 }
 #endif // CK_JIT_BWD_WORKSPACE_V2
@@ -720,16 +720,16 @@ size_t ck_jit_bwd_dq_ws_device_upper_bound(const char*      dq_dk_dv_blob,
 }
 
 __attribute__((visibility("hidden")))
-void* ck_jit_bwd_get_prepare_ws_func(const char* dq_dk_dv_blob)
+void* ck_jit_bwd_get_prepare_ws_device_func(const char* dq_dk_dv_blob)
 {
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
-    if (!state->fn_prepare_ws_host) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: dq_prepare_ws_host symbol not found in %s\n",
+    if (!state->fn_prepare_ws_device) {
+        ::fprintf(stderr, "[CK-JIT] ERROR: dq_prepare_ws_device symbol not found in %s\n",
                   dq_dk_dv_blob);
         return nullptr;
     }
-    return state->fn_prepare_ws_host;
+    return state->fn_prepare_ws_device;
 }
 #endif // CK_JIT_BWD_WORKSPACE_V2
 

@@ -193,7 +193,7 @@ def _build_runtime_cmd(hipcc, is_fwd, ck_include, ck_fmha_include,
     # "[CK_TILE] Use Unified Workspace for FMHA BWD".
     # When present, -DCK_JIT_BWD_WORKSPACE_V2=1 enables the new runtime helpers
     # (ck_jit_bwd_dq_ws_host_size, ck_jit_bwd_dq_ws_device_upper_bound,
-    #  ck_jit_bwd_get_prepare_ws_func) in ck_jit_runtime.cpp.
+    #  ck_jit_bwd_get_prepare_ws_device_func) in ck_jit_runtime.cpp.
     _fmha_bwd_hpp = os.path.join(ck_fmha_include, "fmha_bwd.hpp") if ck_fmha_include else ""
     if _fmha_bwd_hpp and os.path.isfile(_fmha_bwd_hpp):
         try:

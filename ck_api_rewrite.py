@@ -107,8 +107,8 @@ def _detect_bwd_scheme_and_lambda():
         'ck_jit_bwd_dq_ws_device_upper_bound(dq_, ',
         body)
     body = _re.sub(
-        r'&fmha_bwd_dq_dk_dv_dq_prepare_ws_host_\s*<[^>]+>',
-        'reinterpret_cast<PrepareWorkspaceHostFunc>(ck_jit_bwd_get_prepare_ws_func(dq_))',
+        r'&fmha_bwd_dq_dk_dv_dq_prepare_ws_device_\s*<[^>]+>',
+        'reinterpret_cast<PrepareWorkspaceDeviceFunc>(ck_jit_bwd_get_prepare_ws_device_func(dq_))',
         body)
     body = _re.sub(
         r'fmha_bwd_dq_dk_dv_needs_zero_dq_acc_\s*<[^>]+>\s*\(\s*\)',
@@ -466,7 +466,7 @@ def rewrite_api_file(src_path, dst_path, api_kind):
             "size_t ck_jit_bwd_dq_ws_host_size(const char*, ck_tile::index_t);\n"
             "size_t ck_jit_bwd_dq_ws_device_upper_bound(const char*, ck_tile::index_t,\n"
             "    ck_tile::index_t, ck_tile::index_t, ck_tile::index_t, ck_tile::index_t);\n"
-            "void*  ck_jit_bwd_get_prepare_ws_func(const char*);\n"
+            "void*  ck_jit_bwd_get_prepare_ws_device_func(const char*);\n"
         ),
         "fwd_splitkv":  f"float ck_jit_fwd_splitkv_call(const char*, const char*, {_sc}, fmha_fwd_splitkv_args);\n",
         "batch_prefill":f"float ck_jit_batch_prefill_call(const char*, {_sc}, fmha_batch_prefill_args);\n",
