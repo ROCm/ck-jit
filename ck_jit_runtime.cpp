@@ -52,6 +52,7 @@
 #include <future>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -465,8 +466,7 @@ float ck_jit_fwd_call(const char* blob,
         state->fn = compile_and_load_blob(blob, "_Z9fmha_fwd_I", *state);
     });
     if (!state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: fwd blob not resolved: %s\n", blob);
-        return -1.0f;
+        throw std::runtime_error(std::string("[CK-JIT] fwd blob not resolved: ") + blob);
     }
     return reinterpret_cast<fn_t>(state->fn)(s, a);
 }
@@ -507,12 +507,10 @@ float ck_jit_fwd_splitkv_call(const char* sv_blob,
     fut_cb.get();
 
     if (!sv_state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: splitkv blob not resolved: %s\n", sv_blob);
-        return -1.0f;
+        throw std::runtime_error(std::string("[CK-JIT] splitkv blob not resolved: ") + sv_blob);
     }
     if (!cb_state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: splitkv combine blob not resolved: %s\n", combine_blob);
-        return -1.0f;
+        throw std::runtime_error(std::string("[CK-JIT] splitkv combine blob not resolved: ") + combine_blob);
     }
 
     // Replicate what fmha_fwd_splitkv_<> does: launch_kernel with two lambdas.
@@ -538,8 +536,7 @@ float ck_jit_batch_prefill_call(const char* blob,
         state->fn = compile_and_load_blob(blob, "_Z19fmha_batch_prefill_I", *state);
     });
     if (!state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: batch_prefill blob not resolved: %s\n", blob);
-        return -1.0f;
+        throw std::runtime_error(std::string("[CK-JIT] batch_prefill blob not resolved: ") + blob);
     }
     return reinterpret_cast<fn_t>(state->fn)(s, a);
 }
@@ -594,12 +591,10 @@ float ck_jit_bwd_call(const char* dot_do_o_blob,
     if (fut_conv.valid()) fut_conv.get();
 
     if (!dot_state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: bwd dot_do_o blob not resolved: %s\n", dot_do_o_blob);
-        return -1.0f;
+        throw std::runtime_error(std::string("[CK-JIT] bwd dot_do_o blob not resolved: ") + dot_do_o_blob);
     }
     if (!dq_state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: bwd dq_dk_dv blob not resolved: %s\n", dq_dk_dv_blob);
-        return -1.0f;
+        throw std::runtime_error(std::string("[CK-JIT] bwd dq_dk_dv blob not resolved: ") + dq_dk_dv_blob);
     }
 
     if (!has_conv) {
@@ -610,8 +605,7 @@ float ck_jit_bwd_call(const char* dot_do_o_blob,
     }
 
     if (!conv_state->fn) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: bwd convert_dq blob not resolved: %s\n", convert_dq_blob);
-        return -1.0f;
+        throw std::runtime_error(std::string("[CK-JIT] bwd convert_dq blob not resolved: ") + convert_dq_blob);
     }
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ reinterpret_cast<fn_t>(dot_state->fn)(s_, a); }},
@@ -700,9 +694,7 @@ size_t ck_jit_bwd_dq_ws_host_size(const char* dq_dk_dv_blob,
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
     if (!state->fn_ws_host_size) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: dq_ws_host_size symbol not found in %s\n",
-                  dq_dk_dv_blob);
-        return 0;
+        throw std::runtime_error(std::string("[CK-JIT] dq_ws_host_size symbol not found in ") + dq_dk_dv_blob);
     }
     using fn_t = size_t (*)(ck_tile::index_t);
     return reinterpret_cast<fn_t>(state->fn_ws_host_size)(batch);
@@ -719,9 +711,7 @@ size_t ck_jit_bwd_dq_ws_device_upper_bound(const char*      dq_dk_dv_blob,
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
     if (!state->fn_ws_device_upper_bound) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: dq_ws_device_upper_bound symbol not found in %s\n",
-                  dq_dk_dv_blob);
-        return 0;
+        throw std::runtime_error(std::string("[CK-JIT] dq_ws_device_upper_bound symbol not found in ") + dq_dk_dv_blob);
     }
     using fn_t = size_t (*)(ck_tile::index_t, ck_tile::index_t,
                              ck_tile::index_t, ck_tile::index_t, ck_tile::index_t);
@@ -735,9 +725,7 @@ void* ck_jit_bwd_get_prepare_ws_func(const char* dq_dk_dv_blob)
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
     if (!state->fn_prepare_ws_host) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: dq_prepare_ws_host symbol not found in %s\n",
-                  dq_dk_dv_blob);
-        return nullptr;
+        throw std::runtime_error(std::string("[CK-JIT] dq_prepare_ws_host symbol not found in ") + dq_dk_dv_blob);
     }
     return state->fn_prepare_ws_host;
 }
@@ -748,9 +736,7 @@ void* ck_jit_bwd_get_prepare_ws_device_func(const char* dq_dk_dv_blob)
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
     if (!state->fn_prepare_ws_device) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: dq_prepare_ws_device symbol not found in %s\n",
-                  dq_dk_dv_blob);
-        return nullptr;
+        throw std::runtime_error(std::string("[CK-JIT] dq_prepare_ws_device symbol not found in ") + dq_dk_dv_blob);
     }
     return state->fn_prepare_ws_device;
 }
@@ -763,8 +749,7 @@ int ck_jit_bwd_dq_acc_splits(const char* dq_dk_dv_blob,
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
     if (!state->fn_splits) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: dq_acc_splits symbol not found in %s\n", dq_dk_dv_blob);
-        return 1;
+        throw std::runtime_error(std::string("[CK-JIT] dq_acc_splits symbol not found in ") + dq_dk_dv_blob);
     }
     using fn_t = int (*)(const fmha_bwd_traits&);
     return reinterpret_cast<fn_t>(state->fn_splits)(t);
@@ -776,8 +761,7 @@ bool ck_jit_bwd_needs_zero_dq_acc(const char* dq_dk_dv_blob)
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
     if (!state->fn_zero_acc) {
-        ::fprintf(stderr, "[CK-JIT] ERROR: needs_zero_dq_acc symbol not found in %s\n", dq_dk_dv_blob);
-        return true;
+        throw std::runtime_error(std::string("[CK-JIT] needs_zero_dq_acc symbol not found in ") + dq_dk_dv_blob);
     }
     using fn_t = bool (*)();
     return reinterpret_cast<fn_t>(state->fn_zero_acc)();
