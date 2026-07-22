@@ -57,17 +57,18 @@ def compute_blob_hash(source_abs):
     """
     Return the cache key for a blob source file.
 
-    Primary key:  CK_JIT_CK_COMMIT (8-char git short hash), set by
-    ck_jit_build.py before invoking the interceptor.  It covers both
-    source and header changes for any committed CK state.
+    Primary key:  CK_JIT_CK_HASH (8-char git short hash, optionally
+    suffixed with a diff hash), set by ck_jit_build.py before invoking
+    the interceptor.  It covers both source and header changes for any
+    committed CK state, including uncommitted local patches.
 
-    Fallback key: SHA256(source)[:8], used when CK_JIT_CK_COMMIT is
+    Fallback key: SHA256(source)[:8], used when CK_JIT_CK_HASH is
     absent or empty (e.g. standalone interceptor usage).
 
     CK_JIT_EXTRA_CACHE_KEY is appended verbatim to either form.
-    Cache filename: <stem>.so.<ck_commit|sha256>[.<extra_key>]
+    Cache filename: <stem>.so.<ck_hash|sha256>[.<extra_key>]
     """
-    ck_commit = os.environ.get('CK_JIT_CK_COMMIT', '')
+    ck_commit = os.environ.get('CK_JIT_CK_HASH', '')
     if ck_commit:
         key = ck_commit
     else:
