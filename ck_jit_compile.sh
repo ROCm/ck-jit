@@ -74,7 +74,7 @@ atomic_link_so() {
   _TMP_SO="$(mktemp "${OUTPUT}.XXXXXX")"
   # shellcheck disable=SC2086
   if "$HIPCC_BIN" -shared -fPIC "$@" -o "$_TMP_SO"; then
-    mv -n "$_TMP_SO" "$OUTPUT"
+    mv -n "$_TMP_SO" "$OUTPUT" || [ -f "$OUTPUT" ]
     rm -f "$_TMP_SO"  # no-op if mv moved it; removes stale temp on no-clobber
     _TMP_SO=""
   else
