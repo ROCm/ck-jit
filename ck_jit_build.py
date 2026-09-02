@@ -26,6 +26,7 @@
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -500,6 +501,38 @@ def _install_artifacts(tmp_dir, aiter_dir, install_dir, jit_name):
 
 
 # ---------------------------------------------------------------------------
+# CK sources hash (fallback cache key when git is unavailable)
+# ---------------------------------------------------------------------------
+
+def _ck_sources_hash(ck_dir, n_chars=8):
+    """
+    Return a short SHA256 digest of all CK source and script files under
+    ck_dir.  Used as the blob cache key when the CK git commit cannot be
+    determined.
+
+    Included extensions: .cpp, .cu, .hpp, .h, .hip, .py
+    Excluded directories: __pycache__
+    Both the relative file path and its contents contribute to the digest so
+    that renames and content edits both cause a cache miss.
+    """
+    _EXTS = ('.cpp', '.cu', '.hpp', '.h', '.hip', '.py')
+    h = hashlib.sha256()
+    for root, dirs, files in os.walk(ck_dir):
+        dirs[:] = sorted(d for d in dirs if d != '__pycache__')
+        for fname in sorted(files):
+            if not fname.endswith(_EXTS):
+                continue
+            path = os.path.join(root, fname)
+            h.update(os.path.relpath(path, ck_dir).encode())
+            try:
+                with open(path, 'rb') as f:
+                    h.update(f.read())
+            except OSError:
+                pass
+    return h.hexdigest()[:n_chars]
+
+
+# ---------------------------------------------------------------------------
 # jit subcommand
 # ---------------------------------------------------------------------------
 
@@ -603,19 +636,38 @@ def cmd_full(args):
     ck_submodule = os.path.join(aiter_dir, "3rdparty", "composable_kernel")
 
     # Determine CK commit to use as the primary blob cache key.
-    # Passed to ck_build_interceptor.py via CK_JIT_CK_COMMIT; the interceptor
+    # Passed to ck_build_interceptor.py via CK_JIT_CK_HASH; the interceptor
     # falls back to SHA256(source) when this var is absent or empty.
+    #
+    # Key format:
+    #   <8-char-commit-sha>              — clean checkout
+    #   <8-char-commit-sha>.<8-char-diff-hash>  — checkout with local changes
+    #   <8-char-sources-hash>            — git unavailable (hashes all CK sources)
     _r = subprocess.run(
         ["git", "-C", ck_submodule, "rev-parse", "--short=8", "HEAD"],
         capture_output=True, text=True, check=False
     )
-    ck_commit = _r.stdout.strip() if _r.returncode == 0 else ""
-    if ck_commit:
-        print(f"{_TAG} CK commit: {ck_commit}")
+    ck_commit_sha = _r.stdout.strip() if _r.returncode == 0 else ""
+
+    if ck_commit_sha:
+        # Check for uncommitted local changes (e.g. applied patches on top of HEAD).
+        _diff_r = subprocess.run(
+            ["git", "-C", ck_submodule, "diff", "HEAD"],
+            capture_output=True, text=True, check=False
+        )
+        if _diff_r.returncode == 0 and _diff_r.stdout.strip():
+            _diff_hash = hashlib.sha256(_diff_r.stdout.encode()).hexdigest()[:8]
+            ck_commit = f"{ck_commit_sha}.{_diff_hash}"
+            print(f"{_TAG} CK commit: {ck_commit_sha} + local diff hash {_diff_hash}")
+        else:
+            ck_commit = ck_commit_sha
+            print(f"{_TAG} CK commit: {ck_commit_sha}")
     else:
         print(f"{_TAG} WARNING: cannot determine CK commit; "
-              "blob source hash will be used as cache key fallback", file=sys.stderr)
-    env["CK_JIT_CK_COMMIT"] = ck_commit
+              "hashing all CK sources as cache key fallback.", file=sys.stderr)
+        ck_commit = _ck_sources_hash(ck_submodule)
+        print(f"{_TAG} CK sources hash (fallback): {ck_commit}", file=sys.stderr)
+    env["CK_JIT_CK_HASH"] = ck_commit
 
     with ck_build_lock(ck_submodule):
         patch = _select_codegen_patch(ck_submodule)
