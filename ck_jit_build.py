@@ -41,13 +41,17 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TAG = "[CK-JIT]"
 
 # Patches that add //jit_kernel: comments to the CK codegen scripts.
-# Two variants exist because fmha_bwd.py underwent a structural change:
+# Three variants keyed by CK codegen structural changes:
 #   _v1: monolithic FMHA_BWD_API_INNER_DISPATCH  (CK ≤ b09112bb, e.g. aiter)
 #   _v2: split _COMMON/_RUN/_LAUNCHER templates   (CK ≥ b09112bb, e.g. aiter.2)
-# The first commit that introduced the launcher template in codegen/ops:
-_LAUNCHER_COMMIT = "b09112bbad1d5bbacd0e2e0ad15a60fd8bc7e488"
+#   _v3: batch_prefill gains arch_host field and expanded select_kv_load_mode
+#        signature (CK ≥ 22ee91463)
+# Sentinel commits marking each transition:
+_LAUNCHER_COMMIT  = "b09112bbad1d5bbacd0e2e0ad15a60fd8bc7e488"
+_ARCH_HOST_COMMIT = "22ee91463c50a2bfd7c3a3df5655b7ca5d191002"
 _CODEGEN_PATCH_V1 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_0cafa68b6.patch")
 _CODEGEN_PATCH_V2 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_fdf4bb7fc.patch")
+_CODEGEN_PATCH_V3 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_22ee91463.patch")
 _CODEGEN_OPS_PATH = "example/ck_tile/01_fmha/codegen/ops"
 
 
@@ -56,11 +60,11 @@ def _select_codegen_patch(ck_submodule):
     Return the correct patch path for the given CK submodule by inspecting the
     git commit of the codegen/ops directory.
 
-    Uses the commit date to determine whether the launcher-based bwd template
-    (introduced in _LAUNCHER_COMMIT) is present, so the comparison is
-    chronological rather than a linear-ancestry check (works across forks).
+    Uses the commit date to determine which structural variant of the codegen
+    is present, so the comparison is chronological rather than a
+    linear-ancestry check (works across forks).
 
-    Falls back to string-probing fmha_bwd.py if git is unavailable.
+    Falls back to string-probing codegen files if git is unavailable.
     """
     def _git_commit_date(ck_dir, ref):
         r = subprocess.run(
@@ -74,17 +78,36 @@ def _select_codegen_patch(ck_submodule):
         cwd=ck_submodule, capture_output=True, text=True, check=False
     )
     if ops_commit_r.returncode == 0 and ops_commit_r.stdout.strip():
-        ops_commit = ops_commit_r.stdout.strip()
-        ops_ts      = _git_commit_date(ck_submodule, ops_commit)
-        launcher_ts = _git_commit_date(ck_submodule, _LAUNCHER_COMMIT)
+        ops_commit   = ops_commit_r.stdout.strip()
+        ops_ts       = _git_commit_date(ck_submodule, ops_commit)
+        launcher_ts  = _git_commit_date(ck_submodule, _LAUNCHER_COMMIT)
+        arch_host_ts = _git_commit_date(ck_submodule, _ARCH_HOST_COMMIT)
 
-        if ops_ts is not None and launcher_ts is not None:
-            patch = _CODEGEN_PATCH_V2 if ops_ts >= launcher_ts else _CODEGEN_PATCH_V1
-            patch_commit = "fdf4bb7fc" if patch == _CODEGEN_PATCH_V2 else "0cafa68b6"
+        if ops_ts is not None and launcher_ts is not None and arch_host_ts is not None:
+            if ops_ts >= arch_host_ts:
+                patch = _CODEGEN_PATCH_V3
+                patch_commit = "22ee91463"
+            elif ops_ts >= launcher_ts:
+                patch = _CODEGEN_PATCH_V2
+                patch_commit = "fdf4bb7fc"
+            else:
+                patch = _CODEGEN_PATCH_V1
+                patch_commit = "0cafa68b6"
             print(f"{_TAG} codegen/ops commit {ops_commit[:9]}: using patch {patch_commit}")
             return patch
 
-    # Fallback: string-probe fmha_bwd.py when git timestamps are unavailable.
+    # Fallback: string-probe codegen files when git timestamps are unavailable.
+    # Check batch_prefill.py for arch_host (v3), then fmha_bwd.py for launcher (v2).
+    bp_py = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "fmha_batch_prefill.py")
+    try:
+        with open(bp_py, encoding="utf-8") as f:
+            has_arch_host = "arch_host" in f.read()
+    except OSError:
+        has_arch_host = False
+    if has_arch_host:
+        print(f"{_TAG} git unavailable; selected patch 22ee91463 by string probe")
+        return _CODEGEN_PATCH_V3
+
     bwd_py = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "fmha_bwd.py")
     try:
         with open(bwd_py, encoding="utf-8") as f:
@@ -140,7 +163,7 @@ def _apply_codegen_patch(codegen_dir, patch_path):
               file=sys.stderr)
         return False
 
-    base_cmd = ["patch", "-p1", "--forward", "--input", patch_path]
+    base_cmd = ["patch", "-p1", "--forward", "--no-backup-if-mismatch", "--input", patch_path]
 
     # Dry-run first — no files are written, no .rej files created.
     dry = subprocess.run(
@@ -171,7 +194,7 @@ def _revert_codegen_patch(codegen_dir, patch_path):
     if not os.path.exists(patch_path):
         return
     r = subprocess.run(
-        ["patch", "-p1", "--reverse", "--input", patch_path],
+        ["patch", "-p1", "--reverse", "--no-backup-if-mismatch", "--input", patch_path],
         cwd=codegen_dir, capture_output=True, text=True, check=False
     )
     if r.returncode != 0:
