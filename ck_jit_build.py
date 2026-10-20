@@ -42,17 +42,21 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TAG = "[CK-JIT]"
 
 # Patches that add //jit_kernel: comments to the CK codegen scripts.
-# Three variants keyed by CK codegen structural changes:
+# Four variants keyed by CK codegen structural changes:
 #   _v1: monolithic FMHA_BWD_API_INNER_DISPATCH  (CK ≤ b09112bb, e.g. aiter)
 #   _v2: split _COMMON/_RUN/_LAUNCHER templates   (CK ≥ b09112bb, e.g. aiter.2)
 #   _v3: batch_prefill gains arch_host field and expanded select_kv_load_mode
 #        signature (CK ≥ 22ee91463)
+#   _v4: fmha_fwd.py dispatch gains api_trait_fmt_args() helper and
+#        FmhaFwdApiTrait.kernel_filename field (CK ≥ 704ff5758)
 # Sentinel commits marking each transition:
 _LAUNCHER_COMMIT  = "b09112bbad1d5bbacd0e2e0ad15a60fd8bc7e488"
 _ARCH_HOST_COMMIT = "22ee91463c50a2bfd7c3a3df5655b7ca5d191002"
+_FMT_ARGS_COMMIT  = "704ff5758448d70b8d5ee1a5bad3640e25220589"
 _CODEGEN_PATCH_V1 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_0cafa68b6.patch")
 _CODEGEN_PATCH_V2 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_fdf4bb7fc.patch")
 _CODEGEN_PATCH_V3 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_22ee91463.patch")
+_CODEGEN_PATCH_V4 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_704ff5758.patch")
 _CODEGEN_OPS_PATH = "example/ck_tile/01_fmha/codegen/ops"
 
 
@@ -83,9 +87,13 @@ def _select_codegen_patch(ck_submodule):
         ops_ts       = _git_commit_date(ck_submodule, ops_commit)
         launcher_ts  = _git_commit_date(ck_submodule, _LAUNCHER_COMMIT)
         arch_host_ts = _git_commit_date(ck_submodule, _ARCH_HOST_COMMIT)
+        fmt_args_ts  = _git_commit_date(ck_submodule, _FMT_ARGS_COMMIT)
 
         if ops_ts is not None and launcher_ts is not None and arch_host_ts is not None:
-            if ops_ts >= arch_host_ts:
+            if ops_ts >= fmt_args_ts:
+                patch = _CODEGEN_PATCH_V4
+                patch_commit = "704ff5758"
+            elif ops_ts >= arch_host_ts:
                 patch = _CODEGEN_PATCH_V3
                 patch_commit = "22ee91463"
             elif ops_ts >= launcher_ts:
@@ -98,7 +106,18 @@ def _select_codegen_patch(ck_submodule):
             return patch
 
     # Fallback: string-probe codegen files when git timestamps are unavailable.
-    # Check batch_prefill.py for arch_host (v3), then fmha_bwd.py for launcher (v2).
+    # Check fmha_fwd.py for api_trait_fmt_args (v4), then batch_prefill.py for
+    # arch_host (v3), then fmha_bwd.py for launcher (v2).
+    fwd_py = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "fmha_fwd.py")
+    try:
+        with open(fwd_py, encoding="utf-8") as f:
+            has_fmt_args = "api_trait_fmt_args" in f.read()
+    except OSError:
+        has_fmt_args = False
+    if has_fmt_args:
+        print(f"{_TAG} git unavailable; selected patch 704ff5758 by string probe")
+        return _CODEGEN_PATCH_V4
+
     bp_py = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "fmha_batch_prefill.py")
     try:
         with open(bp_py, encoding="utf-8") as f:
@@ -603,7 +622,7 @@ def cmd_full(args):
     print(f"{_TAG} JIT tmp dir: {tmp_dir}")
 
     # Create fake ROCm.
-    fake_rocm, _, fake_cxx = _create_fake_rocm(real_rocm, tmp_dir, interceptor)
+    fake_rocm, fake_hipcc, fake_cxx = _create_fake_rocm(real_rocm, tmp_dir, interceptor)
     print(f"{_TAG} Fake ROCm home : {fake_rocm}")
 
     # Clear prior aiter JIT build.
@@ -616,8 +635,15 @@ def cmd_full(args):
     ck_include_dir   = os.path.join(aiter_dir, "3rdparty", "composable_kernel", "include")
     aiter_include_dir = os.path.join(aiter_dir, "csrc", "include")
 
+    # Prepend the fake ROCm bin to PATH so build systems that discover hipcc via
+    # `which hipcc` (a PATH lookup) — not via $ROCM_PATH/bin/hipcc — also pick up
+    # the wrapped interceptor.  fake_bin contains symlinks to every real ROCm
+    # binary except hipcc (which is wrapped), so other tool lookups are unaffected.
+    fake_bin = os.path.dirname(fake_hipcc)
+
     env = os.environ.copy()
     env.update({
+        "PATH":                            fake_bin + os.pathsep + env.get("PATH", ""),
         "ROCM_PATH":                       fake_rocm,
         "ROCM_HOME":                       "",
         "CXX":                             fake_cxx,

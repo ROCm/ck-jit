@@ -385,7 +385,10 @@ def main():
     basename   = os.path.basename(source_abs)
 
     # Blob files live under a /blob/ directory in the CK source tree.
-    is_blob = "/blob/" in source_abs.replace("\\", "/")
+    # The newer AITER/CK build system emits them under /blob.staging/ instead
+    # (e.g. te_libmha_bwd/blob.staging/fmha_bwd_...cpp); treat both as blobs.
+    _src_norm = source_abs.replace("\\", "/")
+    is_blob = "/blob/" in _src_norm or "/blob.staging/" in _src_norm
 
     # Api files: any fmha_fwd_*_api.{cu,cpp} or fmha_bwd_*_api.{cu,cpp}.
     is_api = _is_api_source(basename)
