@@ -42,18 +42,16 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TAG = "[CK-JIT]"
 
 # Patches that add //jit_kernel: comments to the CK codegen scripts.
-# Four variants keyed by CK codegen structural changes:
-#   _v1: monolithic FMHA_BWD_API_INNER_DISPATCH  (CK ≤ b09112bb, e.g. aiter)
-#   _v2: split _COMMON/_RUN/_LAUNCHER templates   (CK ≥ b09112bb, e.g. aiter.2)
+# The variants keyed by CK codegen structural changes:
+#   _v1: deprecated
+#   _v2: minimal supported CK
 #   _v3: batch_prefill gains arch_host field and expanded select_kv_load_mode
 #        signature (CK ≥ 22ee91463)
 #   _v4: fmha_fwd.py dispatch gains api_trait_fmt_args() helper and
 #        FmhaFwdApiTrait.kernel_filename field (CK ≥ 704ff5758)
 # Sentinel commits marking each transition:
-_LAUNCHER_COMMIT  = "b09112bbad1d5bbacd0e2e0ad15a60fd8bc7e488"
 _ARCH_HOST_COMMIT = "22ee91463c50a2bfd7c3a3df5655b7ca5d191002"
 _FMT_ARGS_COMMIT  = "704ff5758448d70b8d5ee1a5bad3640e25220589"
-_CODEGEN_PATCH_V1 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_0cafa68b6.patch")
 _CODEGEN_PATCH_V2 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_fdf4bb7fc.patch")
 _CODEGEN_PATCH_V3 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_22ee91463.patch")
 _CODEGEN_PATCH_V4 = os.path.join(_SCRIPT_DIR, "codegen_jit_hints_704ff5758.patch")
@@ -85,23 +83,19 @@ def _select_codegen_patch(ck_submodule):
     if ops_commit_r.returncode == 0 and ops_commit_r.stdout.strip():
         ops_commit   = ops_commit_r.stdout.strip()
         ops_ts       = _git_commit_date(ck_submodule, ops_commit)
-        launcher_ts  = _git_commit_date(ck_submodule, _LAUNCHER_COMMIT)
         arch_host_ts = _git_commit_date(ck_submodule, _ARCH_HOST_COMMIT)
         fmt_args_ts  = _git_commit_date(ck_submodule, _FMT_ARGS_COMMIT)
 
-        if ops_ts is not None and launcher_ts is not None and arch_host_ts is not None:
+        if ops_ts is not None and arch_host_ts is not None and fmt_args_ts is not None:
             if ops_ts >= fmt_args_ts:
                 patch = _CODEGEN_PATCH_V4
                 patch_commit = "704ff5758"
             elif ops_ts >= arch_host_ts:
                 patch = _CODEGEN_PATCH_V3
                 patch_commit = "22ee91463"
-            elif ops_ts >= launcher_ts:
+            else:
                 patch = _CODEGEN_PATCH_V2
                 patch_commit = "fdf4bb7fc"
-            else:
-                patch = _CODEGEN_PATCH_V1
-                patch_commit = "0cafa68b6"
             print(f"{_TAG} codegen/ops commit {ops_commit[:9]}: using patch {patch_commit}")
             return patch
 
@@ -128,16 +122,8 @@ def _select_codegen_patch(ck_submodule):
         print(f"{_TAG} git unavailable; selected patch 22ee91463 by string probe")
         return _CODEGEN_PATCH_V3
 
-    bwd_py = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "fmha_bwd.py")
-    try:
-        with open(bwd_py, encoding="utf-8") as f:
-            has_launcher = "FMHA_BWD_API_INNER_DISPATCH_LAUNCHER" in f.read()
-    except OSError:
-        has_launcher = False
-    patch = _CODEGEN_PATCH_V2 if has_launcher else _CODEGEN_PATCH_V1
-    patch_commit = "fdf4bb7fc" if has_launcher else "0cafa68b6"
-    print(f"{_TAG} git unavailable; selected patch {patch_commit} by string probe")
-    return patch
+    print(f"{_TAG} git unavailable; selected patch fdf4bb7fc by string probe")
+    return _CODEGEN_PATCH_V2
 
 
 # ---------------------------------------------------------------------------
