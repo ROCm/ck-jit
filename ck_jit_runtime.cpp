@@ -130,6 +130,7 @@ struct BwdDqBlobState : BlobState {
     void*           fn_ws_device_upper_bound = nullptr;  // dq_ws_device_upper_bound_<>
     void*           fn_prepare_ws_host       = nullptr;  // dq_prepare_ws_host_<>
     void*           fn_prepare_ws_device     = nullptr;  // dq_prepare_ws_device_<>, added by QoLA
+    void*           fn_maxq                  = nullptr;  // maxq_<> (selected_max_seqlen_q_)
 #endif
 };
 
@@ -682,6 +683,9 @@ static void resolve_bwd_dq_ws_meta(const char* dq_dk_dv_blob, BwdDqBlobState& st
                 state.handle, state.so_path.c_str(),
                 "_Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I");
         }
+        state.fn_maxq = find_sym_by_prefix(
+            state.handle, state.so_path.c_str(),
+            "_Z23fmha_bwd_dq_dk_dv_maxq_I");
     });
 }
 #endif // CK_JIT_BWD_WORKSPACE_V2
@@ -739,6 +743,18 @@ void* ck_jit_bwd_get_prepare_ws_device_func(const char* dq_dk_dv_blob)
         throw std::runtime_error(std::string("[CK-JIT] dq_prepare_ws_device symbol not found in ") + dq_dk_dv_blob);
     }
     return state->fn_prepare_ws_device;
+}
+
+__attribute__((visibility("hidden")))
+int ck_jit_bwd_maxq(const char* dq_dk_dv_blob)
+{
+    BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
+    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    if (!state->fn_maxq) {
+        throw std::runtime_error(std::string("[CK-JIT] maxq symbol not found in ") + dq_dk_dv_blob);
+    }
+    using fn_t = int (*)();
+    return reinterpret_cast<fn_t>(state->fn_maxq)();
 }
 #endif // CK_JIT_BWD_WORKSPACE_V2
 

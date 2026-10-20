@@ -119,6 +119,11 @@ def _detect_bwd_scheme_and_lambda():
         r'fmha_bwd_dq_dk_dv_needs_zero_dq_acc_\s*<[^>]+>\s*\(\s*\)',
         'ck_jit_bwd_needs_zero_dq_acc(dq_)',
         body)
+    # maxq_<T,Arch>() → selected_max_seqlen_q_ (CK init() workspace-era scheme).
+    body = _re.sub(
+        r'fmha_bwd_dq_dk_dv_maxq_\s*<[^>]+>\s*\(\s*\)',
+        'ck_jit_bwd_maxq(dq_)',
+        body)
 
     # 2. Fix run lambda: add blob params to capture list, replace inner call.
     body = _re.sub(r'run\s*=\s*\[\s*\]', 'run = [dot_, dq_, conv_]', body)
@@ -467,6 +472,7 @@ def rewrite_api_file(src_path, dst_path, api_kind):
             f"float ck_jit_bwd_call(const char*, const char*, const char*, {_sc}, fmha_bwd_args);\n"
             "int   ck_jit_bwd_dq_acc_splits(const char*, const fmha_bwd_traits&);\n"
             "bool  ck_jit_bwd_needs_zero_dq_acc(const char*);\n"
+            "int   ck_jit_bwd_maxq(const char*);\n"
             "// Workspace API — CK >= 0954a8f3:\n"
             "size_t ck_jit_bwd_dq_ws_host_size(const char*, ck_tile::index_t);\n"
             "size_t ck_jit_bwd_dq_ws_device_upper_bound(const char*, ck_tile::index_t,\n"
