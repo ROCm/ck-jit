@@ -111,26 +111,17 @@ struct BlobState {
     std::string     so_path;           // actual cache path (includes source_hash suffix)
 };
 
-// Extended state for dq_dk_dv blobs: carries the two host-side metadata
-// functions in addition to the kernel fn.  meta_init_flag is separate from
-// init_flag so that ck_jit_bwd_call and ck_jit_bwd_dq_acc_splits can race
-// to fire their respective once_flags independently.
+// Extended state for dq_dk_dv blobs: carries host-side metadata functions in
+// addition to the kernel fn.  All are resolved together under init_flag the
+// first time the blob is loaded — whether that is via ck_jit_bwd_call or a
+// metadata accessor — so correctness does not depend on call ordering.
 struct BwdDqBlobState : BlobState {
-    std::once_flag  meta_init_flag;
-    void*           fn_splits   = nullptr;  // fmha_bwd_dq_dk_dv_dq_acc_splits_<>
     void*           fn_zero_acc = nullptr;  // fmha_bwd_dq_dk_dv_needs_zero_dq_acc_<>
-
-#ifdef CK_JIT_BWD_WORKSPACE_V2
-    // Workspace-based API — CK commit 2c677e84
-    // "[CK_TILE] Use Unified Workspace for FMHA BWD"
-    // Enabled by -DCK_JIT_BWD_WORKSPACE_V2 in ck_post_build._build_runtime_cmd
-    // when fmha_bwd.hpp declares PrepareWorkspaceHostFunc.
-    std::once_flag  ws_meta_init_flag;
     void*           fn_ws_host_size          = nullptr;  // dq_ws_host_size_<>
     void*           fn_ws_device_upper_bound = nullptr;  // dq_ws_device_upper_bound_<>
     void*           fn_prepare_ws_host       = nullptr;  // dq_prepare_ws_host_<>
     void*           fn_prepare_ws_device     = nullptr;  // dq_prepare_ws_device_<>, added by QoLA
-#endif
+    void*           fn_maxq                  = nullptr;  // maxq_<> (selected_max_seqlen_q_)
 };
 
 
@@ -541,6 +532,10 @@ float ck_jit_batch_prefill_call(const char* blob,
     return reinterpret_cast<fn_t>(state->fn)(s, a);
 }
 #else
+// Forward declaration: loads the dq_dk_dv blob and resolves its kernel fn plus
+// all host-side metadata symbols together under init_flag (defined below).
+static void resolve_bwd_dq_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state);
+
 // ---------------------------------------------------------------------------
 // Bwd JIT call: three blobs per dispatch (dot_do_o, dq_dk_dv, convert_dq).
 // The helper template fmha_bwd_<> is rewritten to call this instead
@@ -572,10 +567,10 @@ float ck_jit_bwd_call(const char* dot_do_o_blob,
         });
     });
     auto fut_dq = std::async(std::launch::async, [&]() {
-        std::call_once(dq_state->init_flag, [&]() {
-            dq_state->fn = compile_and_load_blob(
-                dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", *dq_state);
-        });
+        // Routes through resolve_bwd_dq_meta so the single init_flag also resolves
+        // the metadata symbols, regardless of whether this or a metadata accessor
+        // touches the dq_dk_dv blob first.
+        resolve_bwd_dq_meta(dq_blob_s.c_str(), *dq_state);
     });
     std::future<void> fut_conv;
     if (conv_state) {
@@ -615,10 +610,8 @@ float ck_jit_bwd_call(const char* dot_do_o_blob,
 }
 
 // ---------------------------------------------------------------------------
-// Bwd metadata: dq_acc_splits and needs_zero_dq_acc.
-// Both symbols live in the dq_dk_dv blob; we resolve them on first call by
-// scanning .dynsym with find_sym_by_prefix, reusing the handle already opened
-// by ck_jit_bwd_call (or opening it now if called first).
+// Bwd dq_dk_dv blob: load + resolve the kernel fn and all host-side metadata
+// symbols together, once, under init_flag.
 // ---------------------------------------------------------------------------
 
 static void resolve_bwd_dq_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state)
@@ -627,46 +620,10 @@ static void resolve_bwd_dq_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state
     std::call_once(state.init_flag, [&]() {
         state.fn = compile_and_load_blob(
             dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", state);
-    });
-    std::call_once(state.meta_init_flag, [&]() {
         if (!state.handle || state.so_path.empty()) return;
         // Reuse so_path stored by compile_and_load_blob (includes source_hash suffix).
-        state.fn_splits   = find_sym_by_prefix(state.handle, state.so_path.c_str(),
-                                               "_Z32fmha_bwd_dq_dk_dv_dq_acc_splits_I");
         state.fn_zero_acc = find_sym_by_prefix(state.handle, state.so_path.c_str(),
                                                "_Z36fmha_bwd_dq_dk_dv_needs_zero_dq_acc_I");
-    });
-}
-
-#ifdef CK_JIT_BWD_WORKSPACE_V2
-// ---------------------------------------------------------------------------
-// Workspace-based API helpers — CK commit 2c677e84
-// "[CK_TILE] Use Unified Workspace for FMHA BWD"
-//
-// Resolves the following new symbols from the dq_dk_dv blob:
-//   fmha_bwd_dq_dk_dv_dq_ws_host_size_<T,Arch>(int batch)      → size_t
-//   fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_<T,Arch>(...)   → size_t
-//   fmha_bwd_dq_dk_dv_dq_prepare_ws_host_<T,Arch>(void*,...)   → size_t
-//   fmha_bwd_dq_dk_dv_dq_prepare_ws_device_<T,Arch>(void*,...) → void (launches kernel)
-//  The last one is added to CK by QoLA patch
-//
-// ELF mangled-name prefixes (Itanium ABI, template function length prefix):
-//   _Z34fmha_bwd_dq_dk_dv_dq_ws_host_size_I          (34 chars)
-//   _Z43fmha_bwd_dq_dk_dv_dq_ws_device_upper_bound_I  (43 chars)
-//   _Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I        (37 chars)
-//   _Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_device_I      (39 chars)
-// ---------------------------------------------------------------------------
-static void resolve_bwd_dq_ws_meta(const char* dq_dk_dv_blob, BwdDqBlobState& state)
-{
-    std::string dq_blob_s(dq_dk_dv_blob);
-    // Ensure the blob is compiled and loaded first.
-    std::call_once(state.init_flag, [&]() {
-        state.fn = compile_and_load_blob(
-            dq_blob_s, "_Z18fmha_bwd_dq_dk_dv_I", state);
-    });
-    std::call_once(state.ws_meta_init_flag, [&]() {
-        if (!state.handle || state.so_path.empty()) return;
-        // Reuse so_path stored by compile_and_load_blob (includes source_hash suffix).
         state.fn_ws_host_size = find_sym_by_prefix(
             state.handle, state.so_path.c_str(),
             "_Z34fmha_bwd_dq_dk_dv_dq_ws_host_size_I");
@@ -682,17 +639,18 @@ static void resolve_bwd_dq_ws_meta(const char* dq_dk_dv_blob, BwdDqBlobState& st
                 state.handle, state.so_path.c_str(),
                 "_Z37fmha_bwd_dq_dk_dv_dq_prepare_ws_host_I");
         }
+        state.fn_maxq = find_sym_by_prefix(
+            state.handle, state.so_path.c_str(),
+            "_Z23fmha_bwd_dq_dk_dv_maxq_I");
     });
 }
-#endif // CK_JIT_BWD_WORKSPACE_V2
 
-#ifdef CK_JIT_BWD_WORKSPACE_V2
 __attribute__((visibility("hidden")))
 size_t ck_jit_bwd_dq_ws_host_size(const char* dq_dk_dv_blob,
                                     ck_tile::index_t batch)
 {
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
-    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
     if (!state->fn_ws_host_size) {
         throw std::runtime_error(std::string("[CK-JIT] dq_ws_host_size symbol not found in ") + dq_dk_dv_blob);
     }
@@ -709,7 +667,7 @@ size_t ck_jit_bwd_dq_ws_device_upper_bound(const char*      dq_dk_dv_blob,
                                              ck_tile::index_t max_seqlen_k)
 {
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
-    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
     if (!state->fn_ws_device_upper_bound) {
         throw std::runtime_error(std::string("[CK-JIT] dq_ws_device_upper_bound symbol not found in ") + dq_dk_dv_blob);
     }
@@ -723,7 +681,7 @@ __attribute__((visibility("hidden")))
 void* ck_jit_bwd_get_prepare_ws_func(const char* dq_dk_dv_blob)
 {
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
-    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
     if (!state->fn_prepare_ws_host) {
         throw std::runtime_error(std::string("[CK-JIT] dq_prepare_ws_host symbol not found in ") + dq_dk_dv_blob);
     }
@@ -734,25 +692,23 @@ __attribute__((visibility("hidden")))
 void* ck_jit_bwd_get_prepare_ws_device_func(const char* dq_dk_dv_blob)
 {
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
-    resolve_bwd_dq_ws_meta(dq_dk_dv_blob, *state);
+    resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
     if (!state->fn_prepare_ws_device) {
         throw std::runtime_error(std::string("[CK-JIT] dq_prepare_ws_device symbol not found in ") + dq_dk_dv_blob);
     }
     return state->fn_prepare_ws_device;
 }
-#endif // CK_JIT_BWD_WORKSPACE_V2
 
 __attribute__((visibility("hidden")))
-int ck_jit_bwd_dq_acc_splits(const char* dq_dk_dv_blob,
-                               const fmha_bwd_traits& t)
+int ck_jit_bwd_maxq(const char* dq_dk_dv_blob)
 {
     BwdDqBlobState* state = get_bwd_dq_dk_dv_state(dq_dk_dv_blob);
     resolve_bwd_dq_meta(dq_dk_dv_blob, *state);
-    if (!state->fn_splits) {
-        throw std::runtime_error(std::string("[CK-JIT] dq_acc_splits symbol not found in ") + dq_dk_dv_blob);
+    if (!state->fn_maxq) {
+        throw std::runtime_error(std::string("[CK-JIT] maxq symbol not found in ") + dq_dk_dv_blob);
     }
-    using fn_t = int (*)(const fmha_bwd_traits&);
-    return reinterpret_cast<fn_t>(state->fn_splits)(t);
+    using fn_t = int (*)();
+    return reinterpret_cast<fn_t>(state->fn_maxq)();
 }
 
 __attribute__((visibility("hidden")))

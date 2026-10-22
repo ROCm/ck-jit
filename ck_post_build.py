@@ -176,11 +176,6 @@ def _build_runtime_cmd(hipcc, is_fwd, ck_include, ck_fmha_include,
                        arch_flags=None):
     """Return the hipcc argv for compiling ck_jit_runtime.cpp.
 
-    Tested against CK d5acfd8d5 and CK fdf4bb7fc.
-
-    -DENABLE_CK=1: since CK fdf4bb7fc, aiter_hip_common.h guards real CK headers
-    behind this macro (falling back to a stub shim without it).
-
     arch_flags must be provided when CK device headers are included (as they are
     when the dispatch functions reference ck_tile::stream_config / fmha_*_traits).
     Without --offload-arch, hipcc still triggers a device pass and CK's config.hpp
@@ -189,20 +184,6 @@ def _build_runtime_cmd(hipcc, is_fwd, ck_include, ck_fmha_include,
     cmd = [hipcc, "-std=c++20", "-fPIC", "-O2",
            f"-DCK_JIT_IS_FWD={1 if is_fwd else 0}",
            "-DENABLE_CK=1"]
-    # Detect workspace-based BWD API introduced in CK commit 2c677e84
-    # "[CK_TILE] Use Unified Workspace for FMHA BWD".
-    # When present, -DCK_JIT_BWD_WORKSPACE_V2=1 enables the new runtime helpers
-    # (ck_jit_bwd_dq_ws_host_size, ck_jit_bwd_dq_ws_device_upper_bound,
-    # ck_jit_bwd_get_prepare_ws_func, ck_jit_bwd_get_prepare_ws_device_func) in ck_jit_runtime.cpp.
-    # ck_jit_bwd_get_prepare_ws_device_func - is not a part of CK but added by QoLA patches 
-    _fmha_bwd_hpp = os.path.join(ck_fmha_include, "fmha_bwd.hpp") if ck_fmha_include else ""
-    if _fmha_bwd_hpp and os.path.isfile(_fmha_bwd_hpp):
-        try:
-            with open(_fmha_bwd_hpp, encoding="utf-8") as _fh:
-                if "PrepareWorkspaceHostFunc" in _fh.read():
-                    cmd.append("-DCK_JIT_BWD_WORKSPACE_V2=1")
-        except OSError:
-            pass
     if arch_flags:
         cmd.extend(arch_flags)
     for env_var in ("CK_JIT_ROOT", "CK_JIT_NAME"):
