@@ -52,8 +52,10 @@ def _family_matches(blob_suffix, concrete_arch):
         return a.startswith("gfx115")
     if blob_suffix == "gfx11":
         return a.startswith("gfx11") and not a.startswith("gfx115")
+    if blob_suffix == "gfx125":
+        return a.startswith("gfx125")
     if blob_suffix == "gfx12":
-        return a.startswith("gfx12")
+        return a.startswith("gfx12") and not a.startswith("gfx125")
     return True  # unknown suffix — conservative include
 
 
