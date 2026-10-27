@@ -80,6 +80,7 @@ def filter_offload_arch_flags(argv, name):
     """
     Return argv with --offload-arch flags restricted to the blob's arch family
     (derived from the filename suffix via _arch_suffix_from_name + _family_matches).
+    -DCK_CMAKE_GPU_TARGET_IDS is narrowed to the same family.
 
     For arch-agnostic blobs (no gfx suffix in name) all flags are kept unchanged.
     Safety fallback: if no matching --offload-arch flag is found (single-arch build
@@ -102,10 +103,32 @@ def filter_offload_arch_flags(argv, name):
                 filtered.append(a)
                 kept_any = True
             i += 1
+        elif a.startswith(_CK_TARGET_IDS_DEFINE):
+            filtered.append(_filter_ck_target_ids(a, blob_suffix))
+            i += 1
         else:
             filtered.append(a)
             i += 1
     return filtered if kept_any else list(argv)
+
+
+_CK_TARGET_IDS_DEFINE = "-DCK_CMAKE_GPU_TARGET_IDS="
+
+
+def _filter_ck_target_ids(flag, blob_suffix):
+    """
+    Restrict a -DCK_CMAKE_GPU_TARGET_IDS=0xHHHH,... flag to the blob's arch family.
+
+    ck_tile resolves the host-side target from the FIRST id only, so a multi-arch
+    list must be narrowed the same way --offload-arch is, or e.g. a gfx125 blob
+    built from "0x0942,0x1250" would pick gfx942 MMA types on the host pass.
+    The flag is returned unchanged when no id matches.
+    """
+    ids = flag[len(_CK_TARGET_IDS_DEFINE):].split(",")
+    # 0x0942 -> gfx942, 0x090A -> gfx90a, 0x12FF (generic) -> gfx12ff
+    kept = [t for t in ids
+            if _family_matches(blob_suffix, "gfx%x" % int(t, 16))]
+    return _CK_TARGET_IDS_DEFINE + ",".join(kept) if kept else flag
 
 
 # ---------------------------------------------------------------------------

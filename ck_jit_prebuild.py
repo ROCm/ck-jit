@@ -226,13 +226,14 @@ def compile_blob(entry, cache_dir, root, hipcc, rocm_lib, force, verbose):
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Build flags from stored argv: skip compiler, source, -c, -o <out>,
+    # Build flags from stored argv (flags only -- the interceptor already dropped
+    # the compiler): skip source, -c, -o <out>,
     # -fvisibility=hidden/-fvisibility-inlines-hidden; absolutize -I/-isystem.
     _DROP_FLAGS = frozenset({"-fvisibility=hidden", "-fvisibility-inlines-hidden"})
     src = blob_file
     flags = []
     argv = entry.get("argv", [])
-    i = 1  # skip argv[0] (compiler)
+    i = 0
     while i < len(argv):
         a = argv[i]
         if a == "-o" and i + 1 < len(argv):
