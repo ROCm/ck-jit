@@ -138,7 +138,9 @@ def ck_build_lock(ck_submodule):
     codegen patch apply/revert.  Blocks until the lock is acquired.
     """
     lock_path = os.path.join(ck_submodule, _CODEGEN_OPS_PATH, "__init__.py")
-    with open(lock_path, "r", encoding="utf-8") as lf:
+    # Open for writing (without truncating): on NFS, flock() is emulated with POSIX
+    # locks, and an exclusive one on a read-only descriptor fails with EBADF.
+    with open(lock_path, "r+", encoding="utf-8") as lf:
         print(f"{_TAG} Waiting for build lock ({lock_path})...")
         fcntl.flock(lf, fcntl.LOCK_EX)
         print(f"{_TAG} build lock acquired.")
